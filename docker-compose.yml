@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      DB_PATH: /data/gatepass.db
+      SKIP_TX_VERIFY: "true"
+      NIMIQ_RPC_URL: https://rpc.nimiq.com
+    volumes:
+      - gatepass-data:/data
+
+  web:
+    image: node:22-bookworm-slim
+    working_dir: /app
+    command: sh -c "npm install && npm run build -w @gatepass/shared && npm run dev -w @gatepass/web -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8787
+      VITE_ALLOW_DEMO: "true"
+    volumes:
+      - .:/app
+      - web_node_modules:/app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  gatepass-data:
+  web_node_modules:
