@@ -1,5 +1,7 @@
 # GatePass
 
+![GatePass](apps/web/public/thumbnail.png)
+
 NIM-native event ticketing Mini App for **Nimiq Pay**.
 
 Create an event → attendees pay NIM → rotating TOTP QR at the door → offline-capable gate scan → Proof of Attendance badge after the event.
