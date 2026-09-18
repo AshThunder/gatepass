@@ -18,6 +18,7 @@ const TABLET_KEY = 'gatepass:gateTablet'
 const AUTO_MS = 45_000
 
 type Mode = 'unlock' | 'scan'
+type ScanResult = 'ok' | 'used' | 'deny'
 
 const props = defineProps<{
   pendingUnlock?: {
@@ -38,7 +39,8 @@ const unlockInput = ref('')
 const ticketInput = ref('')
 const message = ref('')
 const error = ref('')
-const lastResult = ref<'ok' | 'fail' | null>(null)
+const lastResult = ref<ScanResult | null>(null)
+const resultDetail = ref('')
 const scanning = ref(false)
 const pendingCount = ref(0)
 const cameraHint = ref('')
@@ -49,6 +51,8 @@ const staffPass = ref('')
 const tabletMode = ref(localStorage.getItem(TABLET_KEY) === '1')
 let scanner: Html5Qrcode | null = null
 let handling = false
+let resultClearTimer: ReturnType<typeof setTimeout> | null = null
+let handleLockTimer: ReturnType<typeof setTimeout> | null = null
 let autoTimer: ReturnType<typeof setInterval> | null = null
 let wakeLock: WakeLockSentinel | null = null
 
@@ -166,9 +170,10 @@ async function applyBundle(data: GateBundle, unlockToken?: string, masterSecret?
   unlocked.value = true
   mode.value = 'scan'
   updateSyncLabel(data.syncedAt)
-  message.value = `Unlocked · ${data.eventTitle} — ready to scan`
+  message.value = ''
   error.value = ''
   lastResult.value = null
+  resultDetail.value = ''
   if (unlockToken) {
     localStorage.setItem(`gatepass:event:${data.eventId}:master`, JSON.stringify({
       eventMasterSecret: masterSecret || data.eventMasterSecret,
@@ -270,7 +275,7 @@ async function consumePendingUnlock() {
   }
 }
 
-async function refreshBundle() {
+async function refreshBundle(opts?: { announce?: boolean }) {
   if (!bundle.value)
     return
   const stored = localStorage.getItem(`gatepass:event:${bundle.value.eventId}:master`)
@@ -287,7 +292,8 @@ async function refreshBundle() {
   bundle.value = data
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
   updateSyncLabel(data.syncedAt)
-  message.value = `Synced ${data.tickets.length} ticket(s)`
+  if (opts?.announce)
+    message.value = `Synced ${data.tickets.length} ticket(s)`
 }
 
 async function syncQueue() {
@@ -310,6 +316,49 @@ async function syncQueue() {
   await refreshBundle().catch(() => {})
 }
 
+function denyCopy(msg: string): string {
+  const m = msg.toLowerCase()
+  if (m.includes('already redeemed'))
+    return 'This guest already checked in'
+  if (m.includes('cancelled'))
+    return 'This ticket was cancelled'
+  if (m.includes('different event'))
+    return 'This pass is for a different event'
+  if (m.includes('unknown ticket'))
+    return 'Unknown ticket — tap Refresh, then try again'
+  if (m.includes('invalid') || m.includes('expired'))
+    return 'Code expired — wait for a new QR'
+  if (m.includes('not a gatepass'))
+    return 'This isn’t a GatePass ticket'
+  if (m.includes('unlock first') || m.includes('door pin') || m.includes('guest ticket'))
+    return msg
+  return msg
+}
+
+function showScanResult(kind: ScanResult, detail: string) {
+  lastResult.value = kind
+  resultDetail.value = detail
+  message.value = ''
+  error.value = ''
+  if (resultClearTimer)
+    clearTimeout(resultClearTimer)
+  resultClearTimer = setTimeout(() => {
+    lastResult.value = null
+    resultDetail.value = ''
+    resultClearTimer = null
+  }, kind === 'ok' ? 2400 : 4200)
+}
+
+const resultHeadline = computed(() => {
+  if (lastResult.value === 'ok')
+    return 'ACCEPT'
+  if (lastResult.value === 'used')
+    return 'Already in'
+  if (lastResult.value === 'deny')
+    return 'Can’t enter'
+  return ''
+})
+
 async function handleScan(raw: string) {
   if (handling)
     return
@@ -317,6 +366,7 @@ async function handleScan(raw: string) {
   error.value = ''
   message.value = ''
   lastResult.value = null
+  resultDetail.value = ''
   try {
     const cleaned = raw.trim()
 
@@ -357,35 +407,48 @@ async function handleScan(raw: string) {
     if (!ticket)
       throw new Error('Unknown ticket — tap Refresh')
 
-    if (ticket.status === 'cancelled')
-      throw new Error('Ticket cancelled — DENY')
-    if (ticket.status === 'redeemed')
-      throw new Error('Already redeemed')
+    if (ticket.status === 'cancelled') {
+      showScanResult('deny', 'This ticket was cancelled')
+      return
+    }
+    if (ticket.status === 'redeemed') {
+      showScanResult('used', 'This guest already checked in')
+      return
+    }
 
     const ok = await verifyTotp(ticket.ticketSeed, payload.totp)
-    if (!ok)
-      throw new Error('Invalid / expired code')
+    if (!ok) {
+      showScanResult('deny', 'Code expired — wait for a new QR')
+      return
+    }
 
     ticket.status = 'redeemed'
     localStorage.setItem(STORAGE_KEY, JSON.stringify(bundle.value))
     const queue = loadQueue()
     queue.push({ ticketId: payload.ticketId, totp: payload.totp, at: Date.now() })
     saveQueue(queue)
-    lastResult.value = 'ok'
-    message.value = `Checked in ${payload.ticketId.slice(0, 8)}…`
+    showScanResult('ok', `In · ${payload.ticketId.slice(0, 8)}…`)
     void syncQueue()
   }
   catch (err) {
-    lastResult.value = 'fail'
-    error.value = err instanceof Error ? err.message : String(err)
+    const msg = err instanceof Error ? err.message : String(err)
+    if (unlocked.value && mode.value === 'scan') {
+      if (/already redeemed/i.test(msg))
+        showScanResult('used', 'This guest already checked in')
+      else
+        showScanResult('deny', denyCopy(msg))
+    }
+    else {
+      error.value = msg
+    }
   }
   finally {
-    setTimeout(() => {
+    if (handleLockTimer)
+      clearTimeout(handleLockTimer)
+    handleLockTimer = setTimeout(() => {
       handling = false
+      handleLockTimer = null
     }, 1200)
-    setTimeout(() => {
-      lastResult.value = null
-    }, 2800)
   }
 }
 
@@ -433,9 +496,8 @@ async function submitTicketPaste() {
     error.value = 'Paste GP1:… ticket string'
     return
   }
+  handling = false
   await handleScan(raw)
-  if (lastResult.value === 'ok')
-    ticketInput.value = ''
 }
 
 async function stopScan() {
@@ -461,6 +523,7 @@ function lockGate() {
 
 watch(mode, (m) => {
   lastResult.value = null
+  resultDetail.value = ''
   error.value = ''
   if (m === 'scan' && unlocked.value && !scanning.value)
     void startScan()
@@ -604,18 +667,27 @@ onUnmounted(() => {
           <span class="gp-pill">{{ validCached }} left</span>
           <span v-if="pendingCount" class="gp-pill warn">{{ pendingCount }} queued</span>
         </div>
-        <div id="gate-reader" class="gate-reader tall" />
-        <div v-if="lastResult" class="gate-result" :class="lastResult">
-          {{ lastResult === 'ok' ? 'ACCEPT' : 'DENY' }}
+        <div class="scan-stage">
+          <div id="gate-reader" class="gate-reader tall" />
+          <div
+            v-if="lastResult"
+            class="gate-result"
+            :class="lastResult"
+            :role="lastResult === 'deny' ? 'alert' : 'status'"
+            aria-live="assertive"
+          >
+            <strong>{{ resultHeadline }}</strong>
+            <span v-if="resultDetail">{{ resultDetail }}</span>
+          </div>
         </div>
         <FlashBanner
-          v-if="message"
+          v-if="message && !lastResult"
           kind="success"
           :message="message"
           @clear="message = ''"
         />
         <FlashBanner
-          v-if="error"
+          v-if="error && !lastResult"
           :message="error"
           @clear="error = ''"
         />
@@ -626,7 +698,7 @@ onUnmounted(() => {
           <button v-else class="gp-btn danger" type="button" @click="stopScan">
             Pause
           </button>
-          <button class="gp-btn ghost sm" type="button" @click="refreshBundle">
+          <button class="gp-btn ghost sm" type="button" @click="refreshBundle({ announce: true })">
             Refresh
           </button>
           <button class="gp-btn ghost sm" type="button" @click="lockGate">
@@ -690,12 +762,16 @@ onUnmounted(() => {
   padding: 0;
 }
 .scan-shell .gp-chip-row,
-.scan-shell .gate-result,
 .scan-shell .gp-row,
 .scan-shell .gp-details,
 .scan-shell .gp-sub {
   margin-left: 16px;
   margin-right: 16px;
+}
+.scan-stage {
+  position: relative;
+  margin: 12px 0 0;
+  background: #111318;
 }
 .gate-reader {
   width: 100%;
@@ -705,46 +781,68 @@ onUnmounted(() => {
   background: transparent;
 }
 .gate-reader.tall {
-  min-height: 280px;
+  min-height: 200px;
   border-radius: 0;
   width: 100%;
   margin: 0;
   background: #111318;
 }
 .gate-result {
-  margin-top: 14px;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  margin: 0;
   text-align: center;
-  font-weight: 500;
-  font-size: 2rem;
-  letter-spacing: 0.08em;
-  padding: 22px;
-  min-height: 72px;
+  padding: 20px 16px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  border-radius: 16px;
+  gap: 8px;
   animation: gp-fade-in 220ms var(--gp-ease);
 }
-.gate-result.ok {
-  background: rgba(33, 188, 165, 0.16);
-  color: #0f7a6b;
+.gate-result strong {
+  font-weight: 500;
+  font-size: 1.85rem;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
 }
-.gate-result.fail {
-  background: rgba(217, 68, 79, 0.14);
-  color: var(--gp-danger);
+.gate-result.used strong {
+  letter-spacing: 0.01em;
+}
+.gate-result span {
+  font-size: 0.95rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.35;
+  max-width: 18rem;
+}
+.gate-result.ok {
+  background: rgba(15, 122, 107, 0.94);
+  color: #fff;
+}
+.gate-result.used {
+  background: rgba(233, 178, 19, 0.96);
+  color: var(--gp-navy);
+}
+.gate-result.deny {
+  background: rgba(186, 26, 26, 0.94);
+  color: #fff;
 }
 .tablet .gp-page-title {
   font-size: 1.75rem;
 }
 .tablet .gate-result {
-  font-size: 2.2rem;
-  padding: 28px;
+  padding: 26px 18px;
+}
+.tablet .gate-result strong {
+  font-size: 2.15rem;
 }
 .tablet .gp-btn {
   min-height: 52px;
   font-size: 1rem;
 }
 .tablet .gate-reader.tall {
-  min-height: 320px;
+  min-height: 260px;
 }
 </style>
