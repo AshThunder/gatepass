@@ -32,18 +32,22 @@ export function clearPendingTx() {
 
 function persistTickets(tickets: TicketRecord[], ev: EventRecord) {
   const raw = localStorage.getItem('gatepass:myTickets')
-  let list: Array<{ ticket: TicketRecord, event: EventRecord }> = []
+  let list: Array<{ ticket: TicketRecord, event: EventRecord, origin?: 'purchased' | 'received' }> = []
   try {
     list = raw ? JSON.parse(raw) as typeof list : []
   }
   catch { list = [] }
   for (const t of tickets) {
     list = list.filter(x => x.ticket.id !== t.id)
-    list.unshift({ ticket: t, event: ev })
+    list.unshift({ ticket: t, event: ev, origin: 'purchased' })
   }
   localStorage.setItem('gatepass:myTickets', JSON.stringify(list.slice(0, 40)))
-  if (tickets[0])
-    localStorage.setItem('gatepass:myTicket', JSON.stringify({ ticket: tickets[0], event: ev }))
+  if (tickets[0]) {
+    localStorage.setItem(
+      'gatepass:myTicket',
+      JSON.stringify({ ticket: tickets[0], event: ev, origin: 'purchased' }),
+    )
+  }
 }
 
 export async function claimPendingTx(): Promise<{

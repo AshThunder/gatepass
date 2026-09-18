@@ -113,9 +113,81 @@ ensureColumn('events', 'staff_pass_salt', `staff_pass_salt TEXT`)
 ensureColumn('events', 'staff_pass_hash', `staff_pass_hash TEXT`)
 ensureColumn('events', 'hide_sold_count', `hide_sold_count INTEGER NOT NULL DEFAULT 0`)
 ensureColumn('events', 'hide_redeemed_count', `hide_redeemed_count INTEGER NOT NULL DEFAULT 0`)
+ensureColumn('events', 'hall_slot_id', `hall_slot_id TEXT`)
 ensureColumn('tickets', 'cancelled_at', `cancelled_at TEXT`)
 ensureColumn('tickets', 'tier_id', `tier_id TEXT`)
 ensureColumn('tickets', 'seat_id', `seat_id TEXT`)
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ticket_transfers (
+    id TEXT PRIMARY KEY,
+    from_address TEXT NOT NULL,
+    to_address TEXT NOT NULL,
+    from_ticket_id TEXT NOT NULL,
+    to_ticket_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    tier_id TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_transfers_from ON ticket_transfers(from_address);
+  CREATE INDEX IF NOT EXISTS idx_transfers_to ON ticket_transfers(to_address);
+  CREATE INDEX IF NOT EXISTS idx_tickets_buyer ON tickets(buyer_address);
+
+  CREATE TABLE IF NOT EXISTS auth_challenges (
+    nonce TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash TEXT PRIMARY KEY,
+    address TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+`)
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS hall_slots (
+    id TEXT PRIMARY KEY,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    rent_luna INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('open', 'held', 'booked')),
+    event_id TEXT,
+    renter_address TEXT,
+    rent_tx_hash TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_hall_slots_starts ON hall_slots(starts_at);
+`)
+
+/** Seed upcoming open hall evenings if none exist in the future. */
+export function seedHallSlots() {
+  const rentNim = Number(process.env.HALL_RENT_NIM ?? '5')
+  const rentLuna = Math.round((Number.isFinite(rentNim) ? rentNim : 5) * 100_000)
+  const future = db.prepare(`
+    SELECT COUNT(*) AS c FROM hall_slots
+    WHERE starts_at > datetime('now') AND status = 'open'
+  `).get() as { c: number }
+  if (future.c >= 2)
+    return
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO hall_slots (id, starts_at, ends_at, rent_luna, status, event_id, renter_address, rent_tx_hash)
+    VALUES (?, ?, ?, ?, 'open', NULL, NULL, NULL)
+  `)
+  const now = new Date()
+  for (let i = 1; i <= 6; i++) {
+    const day = new Date(now)
+    day.setDate(day.getDate() + i)
+    day.setHours(18, 0, 0, 0)
+    const end = new Date(day)
+    end.setHours(23, 0, 0, 0)
+    const id = `hall-${day.toISOString().slice(0, 10)}`
+    insert.run(id, day.toISOString(), end.toISOString(), rentLuna)
+  }
+}
+
+seedHallSlots()
+
 
 // If legacy CHECK prevents cancelled status, rebuild tickets table
 const ticketSql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='tickets'`).get() as { sql?: string } | undefined)?.sql || ''
@@ -194,7 +266,19 @@ export interface EventRow {
   staff_pass_hash: string | null
   hide_sold_count: number
   hide_redeemed_count: number
+  hall_slot_id: string | null
   created_at: string
+}
+
+export interface HallSlotRow {
+  id: string
+  starts_at: string
+  ends_at: string
+  rent_luna: number
+  status: string
+  event_id: string | null
+  renter_address: string | null
+  rent_tx_hash: string | null
 }
 
 export interface TicketRow {

@@ -1,4 +1,7 @@
 import type {
+  AuthChallengeResponse,
+  AuthSessionRequest,
+  AuthSessionResponse,
   CreateEventRequest,
   CreateEventResponse,
   EventRecord,
@@ -6,13 +9,17 @@ import type {
   GuestRow,
   HoldRequest,
   HoldResponse,
+  InboxTicket,
   InventorySnapshot,
+  OutboxTransfer,
   PurchaseRequest,
   PurchaseResponse,
   SeatRecord,
   SeatTemplateId,
+  HostUnlockResponse,
   StaffUnlockResponse,
   TicketRecord,
+  TransferTicketResponse,
   WaitlistEntry,
 } from '@gatepass/shared'
 
@@ -54,6 +61,12 @@ export const api = {
   seatTemplates: () => request<{
     templates: Array<{ id: SeatTemplateId, label: string, description: string }>
   }>('/seat-templates'),
+  getHall: () => request<import('@gatepass/shared').HallInfo>('/hall'),
+  rentHall: (slotId: string, body: import('@gatepass/shared').RentHallRequest) =>
+    request<import('@gatepass/shared').RentHallResponse>(`/hall/slots/${encodeURIComponent(slotId)}/rent`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   createHold: (eventId: string, body: HoldRequest) =>
     request<HoldResponse>(`/events/${eventId}/holds`, {
       method: 'POST',
@@ -77,10 +90,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ unlockToken }),
     }),
-  transferTicket: (id: string, toAddress: string, fromAddress?: string) =>
-    request<{ cancelledTicketId: string, ticket: TicketRecord }>(`/tickets/${id}/transfer`, {
+  transferTicket: (id: string, toAddress: string, fromAddress: string) =>
+    request<TransferTicketResponse>(`/tickets/${id}/transfer`, {
       method: 'POST',
       body: JSON.stringify({ toAddress, fromAddress }),
+    }),
+  authChallenge: () => request<AuthChallengeResponse>('/auth/challenge'),
+  authSession: (body: AuthSessionRequest) =>
+    request<AuthSessionResponse>('/auth/session', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  ticketInbox: (token: string) =>
+    request<{ tickets: InboxTicket[] }>('/tickets/inbox', {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+  ticketOutbox: (token: string) =>
+    request<{ transfers: OutboxTransfer[] }>('/tickets/outbox', {
+      headers: { Authorization: `Bearer ${token}` },
     }),
   gateBundle: (eventId: string, token: string) =>
     request<GateBundle>(`/events/${eventId}/gate-bundle?token=${encodeURIComponent(token)}`),
@@ -97,6 +124,11 @@ export const api = {
     request<StaffUnlockResponse>(`/events/${eventId}/staff-unlock`, {
       method: 'POST',
       body: JSON.stringify({ passcode }),
+    }),
+  hostUnlock: (eventId: string, sessionToken: string) =>
+    request<HostUnlockResponse>(`/events/${eventId}/host-unlock`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${sessionToken}` },
     }),
   setStaffPasscode: (eventId: string, unlockToken: string, passcode: string | null) =>
     request<{ ok: boolean, hasStaffPasscode: boolean, staffPasscode: string | null }>(

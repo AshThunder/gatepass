@@ -4,42 +4,43 @@
 
 NIM-native event ticketing Mini App for **Nimiq Pay**.
 
-Create an event → guests pay with NIM → rotating TOTP QR at the door → offline-capable gate scan → Proof of Attendance badge after the event.
+Create an event → guests pay with NIM → rotating TOTP QR at the door → Gate scan → Proof of Attendance after the show.
 
 ## Try it
 
 | | |
 |---|---|
-| **Live app** | https://gatepass-production-452c.up.railway.app |
-| **Nimiq Pay deeplink** | `nimiqpay://miniapp?url=https://gatepass-production-452c.up.railway.app` |
+| **Live app** | https://gpass.up.railway.app |
+| **Nimiq Pay deeplink** | `nimiqpay://miniapp?url=https://gpass.up.railway.app` |
 | **Repo** | https://github.com/AshThunder/gatepass |
 
-Open the live URL in a browser for a quick look, or open the deeplink inside **Nimiq Pay → Mini Apps** for real wallet payments.
+Open the live URL in a browser for a quick look. Open the deeplink inside **Nimiq Pay → Mini Apps** for wallet connect, sign-in, and real NIM payments.
 
 ## Problem
 
-Crypto events still lean on PDF tickets and screenshot QR codes that anyone can copy. GatePass keeps ticketing where payments already happen: inside Nimiq Pay. Hosts sell tickets in NIM, guests get a time-based QR that is hard to fake, and door staff check people in with a dedicated Gate mode.
+Crypto events still lean on PDF tickets and screenshot QR codes that anyone can copy. GatePass keeps ticketing where payments already happen: inside Nimiq Pay. Hosts sell tickets in NIM, guests get a time-based QR that is hard to fake, and door staff check people in from the host phone or with a staff PIN on Gate.
 
 ## Features
 
-- **Discover** — browse upcoming events, search, filter by today / weekend / all
-- **Buy with NIM** — `sendBasicTransactionWithData` via `@nimiq/mini-app-sdk`, memo-verified ticket issue
-- **Demo tickets** — optional no-chain path for judges and dry runs (`VITE_ALLOW_DEMO` / `SKIP_TX_VERIFY`)
-- **Tickets** — rotating TOTP QR pass, transfer, reminder, multi-ticket wallet view
-- **Host** — simple price + capacity create, optional advanced tiers / seat maps, share night, guest list, staff PIN + QR
-- **Gate** — host or staff unlock, camera scan, offline redeem queue + sync
+- **Discover** — upcoming events, search, today / weekend / all; **Nimiq Hall** nights get a Hall chip
+- **Nimiq Hall** — rent a platform venue evening (100 labeled seats, rows A–J) and sell the map
+- **Buy with NIM** — `sendBasicTransactionWithData` via `@nimiq/mini-app-sdk`; memo-verified issue
+- **Demo tickets** — optional no-chain path for dry runs (`VITE_ALLOW_DEMO` / `SKIP_TX_VERIFY`)
+- **Tickets** — rotating TOTP pass, send to a friend, inbox, reminder, Proof of Attendance badge
+- **Host** — Create or book the hall → My events: share link, **Check in guests**, staff PIN
+- **Gate** — host check-in unlocks the door on this phone; staff type the PIN; tablet mode `?tab=gate&tablet=1`
+- **Seat holds** — reserved seats lock for a few minutes while you pay
 - **Privacy toggles** — hide public sold / check-in counts; Host manage still sees full stats
-- **Proof of Attendance** — badge after the event for checked-in guests
 
 ## How it works (no smart contracts)
 
 GatePass uses Nimiq as a **payment rail**, not an NFT ticket ledger.
 
-1. Host creates an event. API stores metadata and an event master secret.
-2. Guest pays the organizer address with memo `GATEPASS:<eventId>` (quantity encoded when needed).
+1. Host creates an event (or rents **Nimiq Hall**). API stores metadata and an event master secret.
+2. Guest pays the organizer address with memo `GATEPASS:<eventId>` (quantity encoded when needed). Hall rent uses memo `GATEPASS:HALL:<slotId>` to the platform address.
 3. API verifies the tx over RPC (recipient, amount, memo, confirmations), then issues a ticket seed = HMAC(master, ticketId).
 4. Guest shows a rotating TOTP QR derived from that seed.
-5. Gate unlocks with the host unlock token (or staff PIN), verifies TOTP, marks the ticket redeemed.
+5. Host taps **Check in guests**, or staff type the door PIN on Gate. TOTP is verified and the ticket is marked redeemed.
 
 Private keys never leave Nimiq Pay. Tickets are cryptographic credentials backed by on-chain payments and stored in SQLite.
 
@@ -48,17 +49,17 @@ Private keys never leave Nimiq Pay. Tickets are cryptographic credentials backed
 | Tab | Role |
 |-----|------|
 | **Discover** | Browse and buy |
-| **Tickets** | Show QR / badge |
-| **Host** | Create, share, manage guests |
-| **Gate** | Unlock door + scan |
+| **Tickets** | Show QR / send / inbox |
+| **Host** | Create, book Hall, check in, guests |
+| **Gate** | Staff PIN + scan (tablet-friendly) |
 
 ## Stack
 
-- `apps/web` — Vue 3 + Vite + `@nimiq/mini-app-sdk` (Nimiq gold / navy UI)
+- `apps/web` — Vue 3 + Vite + `@nimiq/mini-app-sdk`
 - `apps/api` — Hono + SQLite (events, payment verify, inventory, redeem)
-- `packages/shared` — types + TOTP / QR helpers
+- `packages/shared` — types, TOTP / QR, Nimiq address helpers
 
-Monorepo (npm workspaces). Single Docker image serves API + static Mini App (same origin, `/api/*`).
+Monorepo (npm workspaces). One Docker image serves API + Mini App (same origin, `/api/*`).
 
 ## Quick start
 
@@ -75,15 +76,18 @@ Or:
 docker compose up --build
 ```
 
-Open `http://localhost:5173` in a browser, or the Vite **Network** URL inside **Nimiq Pay → Mini Apps**.
+Open `http://localhost:5173`, or the Vite Network URL inside **Nimiq Pay → Mini Apps**.
 
 ### Happy path (demo)
 
-1. **Discover** → open an event  
-2. **Get demo ticket** (or Pay with NIM in Nimiq Pay) → **Tickets** shows rotating QR  
-3. **Host** → create event → save gate unlock QR  
-4. **Gate** → unlock with host / staff QR → scan ticket QR  
-5. After event end + 24h, a redeemed ticket shows the **Proof of Attendance** badge  
+**Fast path (~60s):**
+
+1. **Discover** → open a listed event (or **Host** → Create / Book Nimiq Hall)
+2. Pick GA or a labeled seat → **Get demo ticket** (or **Pay with NIM** in Pay)
+3. **Tickets** shows the rotating QR
+4. **Host → My events** → **Check in guests** (or **Gate** + staff PIN) → scan → ACCEPT
+
+**After the event:** a redeemed ticket shows the **Proof of Attendance** badge (24h after end).
 
 ### Real NIM payments (Nimiq Pay)
 
@@ -95,13 +99,15 @@ NIMIQ_NETWORK=mainnet SKIP_TX_VERIFY=false npm run dev:api
 NIMIQ_NETWORK=testnet NIMIQ_RPC_URL=http://<your-testnet-rpc>:8648 SKIP_TX_VERIFY=false npm run dev:api
 ```
 
-1. Open the Mini App inside Nimiq Pay (LAN or hosted URL).
-2. Host connects wallet (payout address must match the Pay network).
+1. Open the Mini App inside Nimiq Pay.
+2. Host connects — payout address must match the Pay network.
 3. Guest taps **Pay with NIM** → confirms `sendBasicTransactionWithData` with memo `GATEPASS:<eventId>`.
 4. API polls `getTransactionByHash`, checks recipient / amount / memo, then issues the ticket seed.
-5. If the app closes after payment but before claim, reopen **Tickets** — pending `txHash` resumes from `localStorage`.
+5. If the app closes after payment, reopen **Tickets** — pending `txHash` resumes from `localStorage`.
 
 Check `/network` (or `/api/network` in production) for RPC reachability and tip height.
+
+`SKIP_TX_VERIFY=true` only allows client `demo:true` purchases. Real Pay transactions are still verified on-chain.
 
 ## Environment
 
@@ -115,6 +121,9 @@ Check `/network` (or `/api/network` in production) for RPC reachability and tip 
 | `NIMIQ_RPC_URL` | Optional RPC override |
 | `NIMIQ_MIN_CONFIRMATIONS` | Confirmations before issue (default `1`) |
 | `SKIP_TX_VERIFY` | Allow `demo:true` purchases when `true` |
+| `HALL_NAME` | Platform venue label (default `Nimiq Hall`) |
+| `HALL_RENT_NIM` | Slot rent in NIM (default `5`) |
+| `HALL_PLATFORM_ADDRESS` | NIM address that receives hall rent |
 | `STATIC_DIR` | Serve Mini App build (set in Docker) |
 
 **Web** (`apps/web/.env.example`)
@@ -122,7 +131,7 @@ Check `/network` (or `/api/network` in production) for RPC reachability and tip 
 | Variable | Purpose |
 |----------|---------|
 | `VITE_API_BASE_URL` | API base (`/api` in prod / Vite proxy) |
-| `VITE_ALLOW_DEMO` | Show **Get demo ticket** button |
+| `VITE_ALLOW_DEMO` | Show **Get demo ticket** |
 
 ## Deploy (Railway)
 
@@ -145,7 +154,7 @@ Suggested variables:
 | `NIMIQ_NETWORK` | `mainnet` |
 | `SKIP_TX_VERIFY` | `true` (demo tickets work; **real Pay txs still verified**) |
 
-Deeplink:
+Live example: https://gpass.up.railway.app
 
 ```text
 nimiqpay://miniapp?url=https://YOUR-DOMAIN
@@ -156,13 +165,13 @@ nimiqpay://miniapp?url=https://YOUR-DOMAIN
 | Command | Description |
 |---------|-------------|
 | `npm run dev:web` | Vite Mini App |
-| `npm run dev:api` | API server |
-| `npm test` | TOTP golden-vector tests |
+| `npm run dev:api` | API |
+| `npm test` | Shared unit tests (TOTP, addresses) |
 | `npm run build` | Build shared + api + web |
 
 ## Privacy
 
-See [docs/privacy.md](docs/privacy.md). Private keys never leave Nimiq Pay. The API stores event metadata, NIM addresses, ticket ids, and payment tx hashes.
+See [docs/privacy.md](docs/privacy.md). Private keys never leave Nimiq Pay. The API stores event metadata, NIM addresses, ticket ids, payment tx hashes, and signed inbox sessions.
 
 ## License
 

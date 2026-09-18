@@ -77,18 +77,21 @@ function rem(t: TicketTier) {
   margin-bottom: 14px;
 }
 .tier {
+  position: relative;
+  overflow: hidden;
   text-align: left;
   border: 1px solid var(--gp-border);
-  border-radius: 14px;
+  border-radius: 16px;
   padding: 12px 14px;
-  background: #fff;
+  min-height: var(--gp-tap);
+  background: var(--gp-surface);
   color: var(--gp-navy);
   transition: border-color 140ms var(--gp-ease), background 140ms var(--gp-ease);
 }
 .tier.on {
   border-color: rgba(233, 178, 19, 0.7);
   background: rgba(233, 178, 19, 0.1);
-  box-shadow: 0 0 0 1px rgba(233, 178, 19, 0.35);
+  box-shadow: none;
 }
 .tier.off {
   opacity: 0.45;
@@ -105,9 +108,8 @@ function rem(t: TicketTier) {
 }
 .tier__kind {
   font-size: 0.7rem;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-weight: 500;
+  letter-spacing: 0.02em;
   color: var(--gp-muted);
 }
 .tier__bottom {
@@ -117,12 +119,12 @@ function rem(t: TicketTier) {
   justify-content: space-between;
 }
 .tier__price {
-  font-weight: 800;
+  font-weight: 500;
   color: #b8860b;
 }
 .tier__rem {
   font-size: 0.78rem;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--gp-muted);
 }
 .tier__rem.warn {

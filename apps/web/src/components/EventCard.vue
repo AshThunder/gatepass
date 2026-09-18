@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import type { EventRecord } from '@gatepass/shared'
 import { eventSharePath, lunaToNim } from '@gatepass/shared'
+import { copyToClipboard } from '@/lib/copy'
 
 const props = defineProps<{
   event: EventRecord
@@ -92,21 +93,13 @@ const shareUrl = computed(() =>
 
 async function copyLink(e: Event) {
   e.stopPropagation()
-  try {
-    await navigator.clipboard.writeText(shareUrl.value)
+  const ok = await copyToClipboard(shareUrl.value)
+  if (ok) {
+    copied.value = true
+    setTimeout(() => {
+      copied.value = false
+    }, 1500)
   }
-  catch {
-    const ta = document.createElement('textarea')
-    ta.value = shareUrl.value
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
-  }
-  copied.value = true
-  setTimeout(() => {
-    copied.value = false
-  }, 1500)
 }
 </script>
 
@@ -127,6 +120,7 @@ async function copyLink(e: Event) {
 
     <div class="pass__main">
       <div class="pass__chips">
+        <span v-if="event.hallSlotId" class="chip hall">Hall</span>
         <span class="chip" :class="{ hot: timing.hot }">{{ timing.chip }}</span>
         <span v-if="isFree && !isPast" class="chip soft">Free</span>
         <span v-else-if="urgency.warn && !isPast" class="chip warn">{{ urgency.text }}</span>
@@ -176,22 +170,33 @@ async function copyLink(e: Event) {
 
 <style scoped>
 .pass {
+  position: relative;
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr) 8px 72px;
   align-items: stretch;
   min-height: 92px;
-  background: #fff;
-  border: 1px solid rgba(31, 35, 72, 0.1);
+  background: var(--gp-surface);
+  border: 0;
   border-radius: 16px;
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.8) inset,
-    0 8px 20px rgba(31, 35, 72, 0.06);
+  box-shadow: none;
   cursor: pointer;
   overflow: hidden;
-  transition: transform 170ms var(--gp-ease), box-shadow 170ms var(--gp-ease);
+  transition: background 140ms var(--gp-ease);
+}
+.pass::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: currentColor;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms var(--gp-ease);
+}
+.pass:active::after {
+  opacity: 0.08;
 }
 .pass:active {
-  transform: scale(0.985);
+  background: var(--gp-surface-soft);
 }
 .pass.past {
   opacity: 0.55;
@@ -199,10 +204,9 @@ async function copyLink(e: Event) {
 .pass.featured {
   grid-template-columns: 50px minmax(0, 1fr) 8px 84px;
   min-height: 104px;
-  border-color: rgba(233, 178, 19, 0.4);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.8) inset,
-    0 10px 24px rgba(31, 35, 72, 0.08);
+  background: rgba(233, 178, 19, 0.12);
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .pass__date {
@@ -211,20 +215,20 @@ async function copyLink(e: Event) {
   align-items: center;
   justify-content: center;
   gap: 1px;
-  background: #f7f5ef;
+  background: var(--gp-surface-soft);
   border-right: 1px solid rgba(31, 35, 72, 0.06);
   color: var(--gp-navy);
 }
 .pass__month {
   font-size: 0.55rem;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: 0.08em;
   color: var(--gp-muted);
 }
 .pass__day {
   font-size: 1.15rem;
-  font-weight: 800;
-  letter-spacing: -0.04em;
+  font-weight: 500;
+  letter-spacing: -0.02em;
   line-height: 1;
 }
 .pass.featured .pass__day {
@@ -248,9 +252,9 @@ async function copyLink(e: Event) {
   display: inline-flex;
   align-items: center;
   padding: 2px 7px;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 0.6rem;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: 0.02em;
   background: rgba(31, 35, 72, 0.07);
   color: var(--gp-navy);
@@ -263,6 +267,10 @@ async function copyLink(e: Event) {
   background: rgba(33, 188, 165, 0.14);
   color: #0f7a6b;
 }
+.chip.hall {
+  background: rgba(233, 178, 19, 0.22);
+  color: #8a6a00;
+}
 .chip.warn {
   background: rgba(217, 68, 79, 0.12);
   color: var(--gp-danger);
@@ -270,10 +278,10 @@ async function copyLink(e: Event) {
 
 .pass__title {
   margin: 0;
-  font-size: 0.92rem;
-  font-weight: 800;
-  letter-spacing: -0.025em;
-  line-height: 1.2;
+  font-size: 0.95rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.25;
   color: var(--gp-navy);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -316,7 +324,7 @@ async function copyLink(e: Event) {
   align-items: center;
   gap: 4px;
   font-size: 0.82rem;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: -0.02em;
   color: #b8860b;
 }
@@ -330,18 +338,18 @@ async function copyLink(e: Event) {
 }
 .pass__going {
   font-size: 0.65rem;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--gp-muted);
 }
 .pass__share {
   margin-left: auto;
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   border: 1px solid var(--gp-border);
-  border-radius: 999px;
+  border-radius: 16px;
   background: #fff;
   color: var(--gp-navy);
-  font-weight: 800;
+  font-weight: 500;
   font-size: 0.8rem;
 }
 
@@ -372,8 +380,8 @@ async function copyLink(e: Event) {
 }
 .pass__mono {
   font-size: 1.15rem;
-  font-weight: 800;
-  letter-spacing: -0.04em;
+  font-weight: 500;
+  letter-spacing: -0.02em;
   color: rgba(255, 255, 255, 0.92);
 }
 .pass.featured .pass__mono {
@@ -385,15 +393,15 @@ async function copyLink(e: Event) {
   bottom: 6px;
   width: 18px;
   height: 18px;
-  border-radius: 999px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.92);
   color: var(--gp-navy);
   font-size: 0.85rem;
-  font-weight: 800;
+  font-weight: 500;
   display: flex;
   align-items: center;
   justify-content: center;
   line-height: 1;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+  box-shadow: none;
 }
 </style>

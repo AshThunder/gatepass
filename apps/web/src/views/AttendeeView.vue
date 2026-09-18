@@ -6,10 +6,13 @@ import RotatingTicketQr from '@/components/RotatingTicketQr.vue'
 import {
   connectNimiq,
   tryConnectNimiq,
+  ensureConsensus,
   isDemoAllowed,
   listAccounts,
   payForTicket,
+  toErrorMessage,
 } from '@/nimiq/wallet'
+import { newId } from '@/lib/id'
 import {
   type EventRecord,
   type TicketRecord,
@@ -150,6 +153,8 @@ async function buyReal() {
     if (!buyer)
       throw new Error('No Nimiq account available')
 
+    status.value = 'Waiting for Nimiq Pay to sync…'
+    await ensureConsensus(provider)
     status.value = `Approve ${lunaToNim(selected.value.priceLuna)} NIM payment in Nimiq Pay…`
     const txHash = await payForTicket(provider, {
       recipient: selected.value.organizerAddress,
@@ -173,7 +178,7 @@ async function buyReal() {
     walletMessage.value = `Paid from ${buyer}`
   }
   catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
+    error.value = toErrorMessage(err)
     status.value = ''
   }
   finally {
@@ -189,7 +194,7 @@ async function buyDemo() {
   loading.value = true
   try {
     const buyer = address.value || 'NQ07 DEMO BUYER 0000 0000 0000 0000 0000'
-    const txHash = `demo-${crypto.randomUUID()}`
+    const txHash = `demo-${newId()}`
     const issued = await claimTicket(selected.value.id, txHash, buyer, true)
     ticket.value = issued
     eventForTicket.value = selected.value

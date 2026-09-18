@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import { encodeQrPayload, generateTotp, totpSecondsRemaining } from '@/crypto/ticket'
 import { TOTP_PERIOD_SECONDS } from '@gatepass/shared'
+import { copyToClipboard } from '@/lib/copy'
 
 const props = withDefaults(defineProps<{
   eventId: string
@@ -63,29 +64,7 @@ async function copyPayload() {
   }
 
   try {
-    if (navigator.clipboard?.writeText && window.isSecureContext) {
-      await navigator.clipboard.writeText(payload.value)
-      copyStatus.value = 'Copied'
-      setTimeout(() => {
-        if (copyStatus.value === 'Copied')
-          copyStatus.value = ''
-      }, 2000)
-      return
-    }
-  }
-  catch { /* fall through */ }
-
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = payload.value
-    ta.setAttribute('readonly', '')
-    ta.style.position = 'fixed'
-    ta.style.left = '-9999px'
-    document.body.appendChild(ta)
-    ta.select()
-    ta.setSelectionRange(0, ta.value.length)
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
+    const ok = await copyToClipboard(payload.value)
     if (ok) {
       copyStatus.value = 'Copied'
       setTimeout(() => {

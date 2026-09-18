@@ -1,8 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
-import { isDemoAllowed } from '@/nimiq/wallet'
+import { connectNimiq, ensureConsensus, isDemoAllowed, payForHallRent, toErrorMessage } from '@/nimiq/wallet'
 import { useWallet } from '@/nimiq/useWallet'
+import { newId } from '@/lib/id'
+import { copyToClipboard } from '@/lib/copy'
+import { ensureInboxSession } from '@/lib/session'
+import EventCard from '@/components/EventCard.vue'
 import { encodeGateUnlock, encodeStaffUnlock } from '@/crypto/ticket'
 import type {
   CreateEventResponse,
@@ -15,6 +19,9 @@ import type {
 } from '@gatepass/shared'
 import { eventSharePath } from '@gatepass/shared'
 import QRCode from 'qrcode'
+import EventShareCard from '@/components/EventShareCard.vue'
+import HallMapPreview from '@/components/HallMapPreview.vue'
+import FlashBanner from '@/components/FlashBanner.vue'
 
 interface TierDraft {
   name: string
@@ -144,23 +151,57 @@ const manageToken = ref('')
 const guests = ref<GuestRow[]>([])
 const waitlist = ref<WaitlistEntry[]>([])
 const cancelTicketId = ref('')
-const hostPanel = ref<'create' | 'manage' | 'share'>('create')
+const hostPanel = ref<'create' | 'manage'>('create')
 const staffPasscode = ref('')
 const staffQr = ref('')
 const manageStaffPass = ref('')
-const manageStaffQr = ref('')
-const shareStep = ref(0)
+const showLiveBanner = ref(false)
+
+/** Nimiq Hall booking */
+const hall = ref<import('@gatepass/shared').HallInfo | null>(null)
+const hallSlotId = ref('')
+const hallTitle = ref('')
+const hallTicketPrice = ref(1)
+const hallBooking = ref(false)
+const showHallPreview = ref(false)
+const hallOpen = ref(false)
+
+const props = defineProps<{
+  expandHall?: boolean
+  active?: boolean
+}>()
+
+const emit = defineEmits<{
+  checkIn: [payload: { eventId: string, token: string, secret: string }]
+}>()
+
+function eventUrl(id: string) {
+  return `${window.location.origin}${window.location.pathname}${eventSharePath(id)}`
+}
 
 const shareUrl = computed(() => {
   const id = created.value?.event.id || manageEventId.value
   if (!id)
     return window.location.origin
-  return `${window.location.origin}${window.location.pathname}${eventSharePath(id)}`
+  return eventUrl(id)
+})
+
+const gateUnlockUrl = computed(() => {
+  const id = manageEventId.value
+  if (!id)
+    return ''
+  const payload = localStorage.getItem(`gatepass:event:${id}:unlockPayload`) || unlockPayload.value
+  return payload || `${window.location.origin}${window.location.pathname}?tab=gate&tablet=1`
 })
 
 const payDeeplink = computed(() =>
   `nimiqpay://miniapp?url=${encodeURIComponent(shareUrl.value)}`,
 )
+
+async function copyText(text: string, okMsg: string) {
+  const ok = await copyToClipboard(text)
+  status.value = ok ? okMsg : 'Could not copy — long-press the text instead'
+}
 
 function normAddr(addr: string) {
   return addr.replace(/\s+/g, '').toUpperCase()
@@ -176,6 +217,22 @@ function isMine(ev: EventRecord) {
 
 /** Only this organizer’s events — never the full public catalog */
 const myEvents = computed(() => events.value.filter(isMine))
+
+const manageEvent = computed(() =>
+  myEvents.value.find(e => e.id === manageEventId.value) || null,
+)
+
+const justCreatedId = computed(() =>
+  showLiveBanner.value ? (created.value?.event.id || null) : null,
+)
+
+async function refreshDoorKit(id: string) {
+  manageStaffPass.value = localStorage.getItem(`gatepass:event:${id}:staffPass`) || ''
+  const unlock = localStorage.getItem(`gatepass:event:${id}:unlockPayload`)
+    || (created.value?.event.id === id ? unlockPayload.value : '')
+  if (unlock)
+    unlockPayload.value = unlock
+}
 
 function defaultTimes() {
   const start = new Date(Date.now() + 3600_000)
@@ -200,14 +257,75 @@ function tokenFor(eventId: string): string {
   }
 }
 
+function masterFor(eventId: string): string {
+  const raw = localStorage.getItem(`gatepass:event:${eventId}:master`)
+  if (!raw)
+    return ''
+  try {
+    return (JSON.parse(raw) as { eventMasterSecret: string }).eventMasterSecret || ''
+  }
+  catch {
+    return ''
+  }
+}
+
+function persistHostKeys(eventId: string, token: string, secret: string) {
+  manageToken.value = token
+  localStorage.setItem(`gatepass:event:${eventId}:master`, JSON.stringify({
+    eventMasterSecret: secret,
+    gateUnlockToken: token,
+  }))
+  const unlock = encodeGateUnlock(eventId, secret, token)
+  unlockPayload.value = unlock
+  localStorage.setItem(`gatepass:event:${eventId}:unlockPayload`, unlock)
+}
+
+const hostAccessInflight = new Map<string, Promise<boolean>>()
+
+async function ensureHostAccess(eventId: string): Promise<boolean> {
+  const pending = hostAccessInflight.get(eventId)
+  if (pending)
+    return pending
+
+  const run = (async () => {
+    const local = tokenFor(eventId)
+    if (local) {
+      manageToken.value = local
+      return true
+    }
+    manageToken.value = ''
+    const addr = organizerAddress.value.trim()
+    if (!addr)
+      return false
+    try {
+      const session = await ensureInboxSession(addr)
+      const res = await api.hostUnlock(eventId, session.token)
+      persistHostKeys(eventId, res.gateUnlockToken, res.eventMasterSecret)
+      return true
+    }
+    catch (err) {
+      error.value = err instanceof Error ? err.message : String(err)
+      return false
+    }
+  })()
+
+  hostAccessInflight.set(eventId, run)
+  try {
+    return await run
+  }
+  finally {
+    hostAccessInflight.delete(eventId)
+  }
+}
+
 async function refreshEvents() {
   const res = await api.listEvents()
   events.value = res.events
   const mine = events.value.filter(isMine)
-  if (!manageEventId.value || !mine.some(e => e.id === manageEventId.value))
-    manageEventId.value = mine[0]?.id || ''
+  if (manageEventId.value && !mine.some(e => e.id === manageEventId.value))
+    manageEventId.value = ''
   if (manageEventId.value)
-    manageToken.value = tokenFor(manageEventId.value) || manageToken.value
+    manageToken.value = tokenFor(manageEventId.value)
 }
 
 function syncOrganizerFromWallet() {
@@ -238,21 +356,66 @@ watch(walletAddress, (addr) => {
 })
 
 watch(manageEventId, (id) => {
-  if (!id)
+  if (!id) {
+    guests.value = []
+    waitlist.value = []
     return
-  manageToken.value = tokenFor(id) || manageToken.value
-  manageStaffQr.value = ''
+  }
+  manageStaffPass.value = ''
   guests.value = []
   waitlist.value = []
-  if (tokenFor(id) || manageToken.value.trim())
-    void loadGuests()
+  void prepareManagedEvent(id)
 })
+
+async function prepareManagedEvent(id: string) {
+  await ensureHostAccess(id)
+  await refreshDoorKit(id)
+  if (manageToken.value.trim() || tokenFor(id))
+    void loadGuests(true)
+}
+
+async function checkInGuests() {
+  const id = manageEventId.value
+  if (!id)
+    return
+  error.value = ''
+  loading.value = true
+  try {
+    const ok = await ensureHostAccess(id)
+    if (!ok) {
+      if (!error.value)
+        error.value = 'Connect the host wallet to check in guests'
+      return
+    }
+    const token = manageToken.value.trim() || tokenFor(id)
+    const secret = masterFor(id)
+    if (!token) {
+      error.value = 'Could not unlock this event'
+      return
+    }
+    emit('checkIn', { eventId: id, token, secret })
+  }
+  finally {
+    loading.value = false
+  }
+}
+
+function closeManagedEvent() {
+  manageEventId.value = ''
+}
 
 function addressShort(addr: string) {
   const clean = addr.replace(/\s+/g, '')
   if (clean.length < 12)
     return `Connected ${addr}`
   return `Connected ${clean.slice(0, 6)}…${clean.slice(-4)}`
+}
+
+function shortAddr(addr: string) {
+  const clean = addr.replace(/\s+/g, '')
+  if (clean.length < 12)
+    return addr
+  return `${clean.slice(0, 6)}…${clean.slice(-4)}`
 }
 
 function randomStaffPin() {
@@ -331,11 +494,12 @@ async function onCreate() {
       }
     }
 
-    const res = await api.createEvent(body)
+    const res = await api.createEvent({
+      ...body,
+      staffPasscode: randomStaffPin(),
+    })
     created.value = res
     manageEventId.value = res.event.id
-    staffPasscode.value = ''
-    staffQr.value = ''
     const unlock = encodeGateUnlock(res.event.id, res.eventMasterSecret, res.gateUnlockToken)
     unlockPayload.value = unlock
     gateQr.value = await QRCode.toDataURL(unlock, {
@@ -348,10 +512,18 @@ async function onCreate() {
       gateUnlockToken: res.gateUnlockToken,
     }))
     localStorage.setItem(`gatepass:event:${res.event.id}:unlockPayload`, unlock)
+    if (res.staffPasscode) {
+      staffPasscode.value = res.staffPasscode
+      localStorage.setItem(`gatepass:event:${res.event.id}:staffPass`, res.staffPasscode)
+      staffQr.value = await renderStaffQr(res.event.id, res.staffPasscode)
+    }
     await refreshEvents()
-    status.value = 'Event live — set up guests, door lead, then staff'
-    shareStep.value = 0
-    hostPanel.value = 'share'
+    showLiveBanner.value = true
+    status.value = 'Event live — copy the link and share it'
+    hostPanel.value = 'manage'
+    manageToken.value = res.gateUnlockToken
+    await refreshDoorKit(res.event.id)
+    await loadGuests().catch(() => {})
   }
   catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -361,29 +533,148 @@ async function onCreate() {
   }
 }
 
+async function loadHall() {
+  try {
+    hall.value = await api.getHall()
+    const open = hall.value.slots.find(s => s.status === 'open')
+    if (open && !hallSlotId.value)
+      hallSlotId.value = open.id
+  }
+  catch { /* optional */ }
+}
+
+const nextHallSlotLabel = computed(() => {
+  const s = (hall.value?.slots || []).find(x => x.status === 'open')
+  if (!s)
+    return 'No open slots'
+  return new Date(s.startsAt).toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+})
+
+watch(() => props.expandHall, (on) => {
+  if (on)
+    hallOpen.value = true
+})
+
+watch(() => props.active, (on, was) => {
+  if (on && was === false)
+    hallOpen.value = !!props.expandHall
+})
+
+function onHallToggle(ev: Event) {
+  hallOpen.value = (ev.currentTarget as HTMLDetailsElement).open
+}
+
+async function bookHall() {
+  error.value = ''
+  status.value = ''
+  hallBooking.value = true
+  loading.value = true
+  try {
+    if (!hall.value || !hallSlotId.value)
+      throw new Error('Pick a hall slot')
+    if (!organizerAddress.value.trim())
+      throw new Error('Connect wallet / set payout address first')
+    if (!hallTitle.value.trim())
+      throw new Error('Event title required')
+    const slot = hall.value.slots.find(s => s.id === hallSlotId.value)
+    if (!slot || slot.status !== 'open')
+      throw new Error('Pick an open hall slot')
+
+    let txHash: string
+    const demo = isDemoAllowed() && (!hall.value.platformAddress || !walletReady.value)
+    if (demo) {
+      txHash = `demo-hall-${newId()}`
+    }
+    else {
+      if (!hall.value.platformAddress)
+        throw new Error('Hall platform address not configured')
+      status.value = 'Waiting for Nimiq Pay to sync…'
+      const provider = await connectNimiq()
+      await ensureConsensus(provider)
+      status.value = 'Approve hall rent in Nimiq Pay…'
+      txHash = await payForHallRent(provider, {
+        recipient: hall.value.platformAddress,
+        slotId: slot.id,
+        rentLuna: slot.rentLuna,
+      })
+    }
+
+    status.value = 'Booking Nimiq Hall…'
+    const res = await api.rentHall(slot.id, {
+      txHash,
+      organizerAddress: organizerAddress.value.trim(),
+      title: hallTitle.value.trim(),
+      ticketPriceNim: Number(hallTicketPrice.value) || 1,
+      demo: txHash.startsWith('demo-'),
+      hideSoldCount: hideSoldCount.value,
+      hideRedeemedCount: hideRedeemedCount.value,
+    })
+    created.value = {
+      event: res.event,
+      eventMasterSecret: res.eventMasterSecret,
+      gateUnlockToken: res.gateUnlockToken,
+      staffPasscode: res.staffPasscode,
+    }
+    manageEventId.value = res.event.id
+    manageToken.value = res.gateUnlockToken
+    const unlock = encodeGateUnlock(res.event.id, res.eventMasterSecret, res.gateUnlockToken)
+    unlockPayload.value = unlock
+    gateQr.value = await QRCode.toDataURL(unlock, {
+      width: 240,
+      margin: 1,
+      color: { dark: '#1F2348', light: '#FFFFFF' },
+    })
+    localStorage.setItem(`gatepass:event:${res.event.id}:master`, JSON.stringify({
+      eventMasterSecret: res.eventMasterSecret,
+      gateUnlockToken: res.gateUnlockToken,
+    }))
+    localStorage.setItem(`gatepass:event:${res.event.id}:unlockPayload`, unlock)
+    if (res.staffPasscode) {
+      staffPasscode.value = res.staffPasscode
+      localStorage.setItem(`gatepass:event:${res.event.id}:staffPass`, res.staffPasscode)
+      staffQr.value = await renderStaffQr(res.event.id, res.staffPasscode)
+    }
+    await refreshEvents()
+    await loadHall()
+    showLiveBanner.value = true
+    status.value = 'Nimiq Hall booked — event is live'
+    hostPanel.value = 'manage'
+    await refreshDoorKit(res.event.id)
+  }
+  catch (err) {
+    error.value = toErrorMessage(err)
+    status.value = ''
+  }
+  finally {
+    loading.value = false
+    hallBooking.value = false
+  }
+}
+
 async function copyUnlock() {
   if (!unlockPayload.value)
     return
-  try {
-    await navigator.clipboard.writeText(unlockPayload.value)
+  const ok = await copyToClipboard(unlockPayload.value)
+  if (ok) {
     copied.value = true
     setTimeout(() => {
       copied.value = false
     }, 2000)
   }
-  catch {
-    error.value = 'Could not copy — select the GPGATE text manually'
+  else {
+    error.value = 'Could not copy — long-press the code instead'
   }
 }
 
 async function copyShare() {
-  try {
-    await navigator.clipboard.writeText(shareUrl.value)
-    status.value = 'Event link copied'
-  }
-  catch {
-    status.value = shareUrl.value
-  }
+  const ok = await copyToClipboard(shareUrl.value)
+  status.value = ok ? 'Event link copied' : 'Could not copy — long-press the link instead'
 }
 
 async function copyStaffPass() {
@@ -395,13 +686,8 @@ async function copyStaffPass() {
     error.value = 'No staff passcode yet — generate one first'
     return
   }
-  try {
-    await navigator.clipboard.writeText(pin)
-    status.value = 'Staff passcode copied'
-  }
-  catch {
-    status.value = pin
-  }
+  const ok = await copyToClipboard(pin)
+  status.value = ok ? 'Staff passcode copied' : 'Could not copy — long-press the PIN instead'
 }
 
 async function generateStaffAccess() {
@@ -423,7 +709,7 @@ async function generateStaffAccess() {
     created.value = { ...created.value, staffPasscode: saved }
     localStorage.setItem(`gatepass:event:${created.value.event.id}:staffPass`, saved)
     staffQr.value = await renderStaffQr(created.value.event.id, saved)
-    status.value = 'Staff PIN + QR ready — staff can scan this in Gate'
+    status.value = 'New door PIN ready — staff can use it at Gate'
   }
   catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -433,29 +719,29 @@ async function generateStaffAccess() {
   }
 }
 
-async function saveStaffPass() {
+async function saveStaffPass(passcode: string) {
   error.value = ''
   status.value = ''
   if (!manageEventId.value)
     return
-  const token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  const pass = passcode.trim()
+  if (!pass)
+    return
+  let token = manageToken.value.trim() || tokenFor(manageEventId.value)
   if (!token) {
-    error.value = 'Unlock token required to set staff passcode'
+    await ensureHostAccess(manageEventId.value)
+    token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  }
+  if (!token) {
+    error.value = 'Connect the host wallet to change the door PIN'
     return
   }
   loading.value = true
   try {
-    const pass = manageStaffPass.value.trim() || null
     const res = await api.setStaffPasscode(manageEventId.value, token, pass)
-    if (res.staffPasscode) {
-      localStorage.setItem(`gatepass:event:${manageEventId.value}:staffPass`, res.staffPasscode)
-      manageStaffQr.value = await renderStaffQr(manageEventId.value, res.staffPasscode)
-    }
-    else {
-      localStorage.removeItem(`gatepass:event:${manageEventId.value}:staffPass`)
-      manageStaffQr.value = ''
-    }
-    status.value = res.hasStaffPasscode ? 'Staff passcode saved' : 'Staff passcode cleared'
+    localStorage.setItem(`gatepass:event:${manageEventId.value}:staffPass`, pass)
+    manageStaffPass.value = res.staffPasscode || pass
+    status.value = 'Door PIN saved'
     await refreshEvents()
   }
   catch (err) {
@@ -467,18 +753,25 @@ async function saveStaffPass() {
 }
 
 async function generateManageStaffPin() {
-  manageStaffPass.value = randomStaffPin()
-  await saveStaffPass()
+  const pin = randomStaffPin()
+  manageStaffPass.value = pin
+  await saveStaffPass(pin)
 }
 
-async function loadGuests() {
+async function loadGuests(quiet = false) {
   error.value = ''
-  status.value = ''
+  if (!quiet)
+    status.value = ''
   if (!manageEventId.value)
     return
-  const token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  let token = manageToken.value.trim() || tokenFor(manageEventId.value)
   if (!token) {
-    error.value = 'Paste gate unlock token (from create) to load guests'
+    await ensureHostAccess(manageEventId.value)
+    token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  }
+  if (!token) {
+    if (!quiet)
+      error.value = 'Connect the host wallet to see guests'
     return
   }
   manageToken.value = token
@@ -490,7 +783,8 @@ async function loadGuests() {
     ])
     guests.value = g.guests
     waitlist.value = w.waitlist
-    status.value = `${guests.value.length} guest(s), ${waitlist.value.length} waitlisted`
+    if (!quiet)
+      status.value = `${guests.value.length} guest(s), ${waitlist.value.length} waitlisted`
   }
   catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -537,9 +831,13 @@ async function voidTicket() {
     error.value = 'Enter ticket id to cancel'
     return
   }
-  const token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  let token = manageToken.value.trim() || tokenFor(manageEventId.value)
   if (!token) {
-    error.value = 'Unlock token required to cancel'
+    await ensureHostAccess(manageEventId.value)
+    token = manageToken.value.trim() || tokenFor(manageEventId.value)
+  }
+  if (!token) {
+    error.value = 'Connect the host wallet to void a ticket'
     return
   }
   loading.value = true
@@ -561,6 +859,7 @@ onMounted(() => {
   defaultTimes()
   void probeWallet()
   void refreshEvents().catch(() => {})
+  void loadHall()
   void api.seatTemplates().then((r) => {
     seatTemplates.value = r.templates
   }).catch(() => {})
@@ -568,32 +867,84 @@ onMounted(() => {
 </script>
 
 <template>
-  <section>
+  <section class="host">
     <h1 class="gp-page-title">
       Host
     </h1>
     <p class="gp-page-sub">
-      Create events, share links, and manage the door.
+      Create an event or book Nimiq Hall, then share the link.
     </p>
 
     <div class="gp-segment host-tabs" role="tablist">
       <button type="button" :class="{ active: hostPanel === 'create' }" @click="hostPanel = 'create'">
         Create
       </button>
-      <button
-        type="button"
-        :class="{ active: hostPanel === 'share' }"
-        :disabled="!created"
-        @click="created && (hostPanel = 'share')"
-      >
-        Share night
-      </button>
       <button type="button" :class="{ active: hostPanel === 'manage' }" @click="hostPanel = 'manage'">
-        Manage
+        My events
       </button>
     </div>
 
     <template v-if="hostPanel === 'create'">
+
+      <details
+        v-if="hall"
+        class="gp-details hall-book"
+        :open="hallOpen"
+        @toggle="onHallToggle"
+      >
+        <summary>
+          <span class="hall-book__line">
+            <span class="gp-pill gold">Nimiq Hall</span>
+            <span class="hall-book__next">{{ nextHallSlotLabel }}</span>
+          </span>
+        </summary>
+        <div class="hall-book__body">
+          <h2 class="gp-h2">
+            Book the hall
+          </h2>
+          <p class="gp-sub">
+            {{ hall.description }} Cap {{ hall.capacity }} · rent {{ hall.rentNim }} NIM.
+          </p>
+          <button
+            class="gp-btn ghost sm"
+            type="button"
+            style="width: auto; margin-bottom: 10px;"
+            @click="showHallPreview = !showHallPreview"
+          >
+            {{ showHallPreview ? 'Hide hall preview' : 'Hall preview' }}
+          </button>
+          <HallMapPreview
+            v-if="showHallPreview && hall.previewSeats?.length"
+            :seats="hall.previewSeats"
+          />
+          <label class="gp-label">Open slot</label>
+          <select v-model="hallSlotId" class="gp-input gp-select">
+            <option
+              v-for="s in hall.slots.filter(x => x.status === 'open')"
+              :key="s.id"
+              :value="s.id"
+            >
+              {{ new Date(s.startsAt).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) }}
+            </option>
+          </select>
+          <p v-if="!hall.slots.some(s => s.status === 'open')" class="gp-banner warn">
+            No open slots right now.
+          </p>
+          <label class="gp-label">Event title</label>
+          <input v-model="hallTitle" class="gp-input" placeholder="Hex Night at Nimiq Hall">
+          <label class="gp-label">Seat ticket price (NIM)</label>
+          <input v-model.number="hallTicketPrice" class="gp-input" type="number" min="0" step="0.01">
+          <button
+            class="gp-btn secondary"
+            type="button"
+            :disabled="loading || !hallSlotId || !hallTitle.trim()"
+            @click="bookHall"
+          >
+            {{ hallBooking ? 'Booking…' : `Rent hall · ${hall.rentNim} NIM` }}
+          </button>
+        </div>
+      </details>
+
       <div class="gp-card">
         <div class="gp-banner" :class="walletReady ? 'ok' : ''">
           {{ walletMessage }}
@@ -784,7 +1135,7 @@ onMounted(() => {
         <label class="gp-label">Payout address</label>
         <input v-model="organizerAddress" class="gp-input" placeholder="NQ…">
         <p class="gp-sub" style="margin-top: -6px;">
-          Staff PIN / QR is generated after create in Share night.
+          A door PIN is created automatically. You’ll see it under My events.
         </p>
 
         <details class="gp-details">
@@ -802,104 +1153,15 @@ onMounted(() => {
             </div>
           </div>
         </details>
-
+      </div>
+      <div class="gp-sticky-cta gp-sticky-cta--compact">
         <button class="gp-btn" :disabled="loading || !title || !venueName" type="button" @click="onCreate">
           {{ loading ? 'Creating…' : 'Create event' }}
         </button>
       </div>
 
-    </template>
 
-    <template v-else-if="hostPanel === 'share' && created">
-      <div class="gp-card share-pack">
-        <span class="gp-pill ok">Share night pack</span>
-        <h2 class="gp-h2" style="margin-top: 10px;">
-          {{ created.event.title }}
-        </h2>
-        <p class="gp-sub">
-          Three things to hand out tonight — guests, door lead, and staff.
-        </p>
 
-        <div class="share-steps">
-          <button type="button" class="share-step" :class="{ on: shareStep === 0 }" @click="shareStep = 0">
-            1 · Guests
-          </button>
-          <button type="button" class="share-step" :class="{ on: shareStep === 1 }" @click="shareStep = 1">
-            2 · Door lead
-          </button>
-          <button type="button" class="share-step" :class="{ on: shareStep === 2 }" @click="shareStep = 2">
-            3 · Staff
-          </button>
-        </div>
-
-        <div v-if="shareStep === 0" class="share-pane">
-          <h3>Invite guests</h3>
-          <p>Send the event link. They pay with NIM in Discover.</p>
-          <p class="gp-mono">
-            {{ shareUrl }}
-          </p>
-          <button class="gp-btn secondary" type="button" @click="copyShare">
-            Copy event link
-          </button>
-          <p class="gp-label" style="margin-top: 12px;">
-            Nimiq Pay deeplink
-          </p>
-          <p class="gp-mono">
-            {{ payDeeplink }}
-          </p>
-        </div>
-
-        <div v-else-if="shareStep === 1" class="share-pane">
-          <h3>Door lead unlock</h3>
-          <p>Scan this QR in the <strong>Gate</strong> tab first — never a ticket QR.</p>
-          <div class="gp-qr">
-            <img v-if="gateQr" :src="gateQr" alt="Gate unlock QR" width="220" height="220">
-          </div>
-          <button class="gp-btn secondary" type="button" @click="copyUnlock">
-            {{ copied ? 'Copied' : 'Copy GPGATE unlock' }}
-          </button>
-        </div>
-
-        <div v-else class="share-pane">
-          <h3>Staff access</h3>
-          <template v-if="staffPasscode && staffQr">
-            <p>Staff open <strong>Gate → Unlock</strong> and scan this QR (or enter the PIN).</p>
-            <div class="gp-qr">
-              <img :src="staffQr" alt="Staff unlock QR" width="220" height="220">
-            </div>
-            <p class="staff-pin">
-              {{ staffPasscode }}
-            </p>
-            <div class="gp-row">
-              <button class="gp-btn secondary sm" type="button" @click="copyStaffPass">
-                Copy PIN
-              </button>
-              <button class="gp-btn ghost sm" type="button" :disabled="loading" @click="generateStaffAccess">
-                Regenerate
-              </button>
-            </div>
-          </template>
-          <template v-else>
-            <p>Generate a staff PIN + QR after the event is created. Staff scan it at the gate — no host GPGATE needed.</p>
-            <button class="gp-btn" type="button" :disabled="loading" @click="generateStaffAccess">
-              {{ loading ? 'Generating…' : 'Generate staff PIN + QR' }}
-            </button>
-          </template>
-        </div>
-
-        <details class="gp-details">
-          <summary>Advanced secrets</summary>
-          <p class="gp-mono">
-            {{ unlockPayload }}
-          </p>
-          <p class="gp-mono" style="margin-top: 8px;">
-            {{ created.event.id }}|{{ created.gateUnlockToken }}
-          </p>
-          <p class="gp-mono" style="margin-top: 8px;">
-            Master {{ created.eventMasterSecret }}
-          </p>
-        </details>
-      </div>
     </template>
 
     <template v-else-if="hostPanel === 'manage'">
@@ -908,7 +1170,7 @@ onMounted(() => {
           Your events
         </h2>
         <p class="gp-sub">
-          Connect the wallet you used as payout address to manage guests and staff. Other people’s events stay private.
+          Connect the wallet you used when creating. Then pick an event to share it and run the door.
         </p>
         <button class="gp-btn secondary" type="button" @click="connect">
           {{ walletReady ? 'Refresh wallet' : 'Connect Nimiq Pay' }}
@@ -918,136 +1180,236 @@ onMounted(() => {
         </button>
       </div>
 
-      <div v-else class="gp-card">
+      <template v-else-if="!manageEvent">
         <h2 class="gp-h2">
           Your events
         </h2>
-        <ul class="gp-list" style="margin-bottom: 14px;">
-          <li
+        <p class="gp-sub">
+          Open an event to share it, check in guests, and see who bought tickets.
+        </p>
+        <div class="manage-ev-list">
+          <EventCard
             v-for="ev in myEvents"
             :key="ev.id"
-            class="manage-ev"
-            :class="{ on: manageEventId === ev.id }"
-            @click="manageEventId = ev.id"
-          >
-            <strong>{{ ev.title }}</strong>
-            <div class="gp-chip-row" style="margin-top: 8px; margin-bottom: 0;">
-              <span class="gp-pill">{{ ev.soldCount }}{{ ev.capacity != null ? ` / ${ev.capacity}` : '' }} sold</span>
-              <span class="gp-pill ok">{{ ev.redeemedCount }} in</span>
-              <span v-if="ev.soldOut" class="gp-pill warn">Sold out</span>
-            </div>
-          </li>
-        </ul>
-
-        <h2 class="gp-h2">
-          Guest list
-        </h2>
-        <p class="gp-sub">
-          Loads when you pick an event. Void a ticket to deny at the gate.
-        </p>
-        <label class="gp-label">Selected event</label>
-        <select v-model="manageEventId" class="gp-input gp-select">
-          <option disabled value="">
-            Select event
-          </option>
-          <option v-for="ev in myEvents" :key="ev.id" :value="ev.id">
-            {{ ev.title }} · {{ ev.soldCount }} sold
-          </option>
-        </select>
-        <details class="gp-details">
-          <summary>Unlock token</summary>
-          <input
-            v-model="manageToken"
-            class="gp-input"
-            placeholder="Auto-filled if you created it here"
-          >
-        </details>
-        <div class="gp-row">
-          <button class="gp-btn secondary sm" type="button" :disabled="loading" @click="loadGuests">
-            {{ guests.length ? 'Refresh' : 'Load guests' }}
-          </button>
-          <button class="gp-btn ghost sm" type="button" @click="exportCsv">
-            CSV
-          </button>
+            :event="ev"
+            @select="manageEventId = ev.id"
+          />
         </div>
-        <ul v-if="guests.length" class="gp-list" style="margin-top: 12px;">
-          <li v-for="g in guests" :key="g.ticketId">
-            <div style="display: flex; justify-content: space-between; gap: 8px; align-items: center;">
-              <strong style="text-transform: capitalize;">{{ g.status }}</strong>
+      </template>
+
+      <div v-else class="gp-card">
+          <div class="manage-back">
+            <button class="gp-btn ghost sm" type="button" style="width: auto;" @click="closeManagedEvent">
+              ← Events
+            </button>
+          </div>
+
+          <div v-if="justCreatedId === manageEvent.id" class="gp-banner ok">
+            Your event is live. Share the link with guests.
+          </div>
+
+          <EventShareCard :event="manageEvent" />
+
+          <div class="manage-block">
+            <h2 class="gp-h2">
+              Check in
+            </h2>
+            <p class="gp-sub">
+              Scan tickets at the door on this phone.
+            </p>
+            <button
+              class="gp-btn"
+              type="button"
+              style="margin-top: 12px;"
+              :disabled="loading"
+              @click="checkInGuests"
+            >
+              Check in guests
+            </button>
+          </div>
+
+          <div class="manage-block">
+            <h2 class="gp-h2">
+              Staff
+            </h2>
+            <p v-if="manageStaffPass" class="gp-sub">
+              Give this to anyone working the door. They open Gate and type it.
+            </p>
+            <p v-else-if="manageEvent.hasStaffPasscode" class="gp-sub">
+              Staff already have a PIN. Change it to make a new one on this phone.
+            </p>
+            <p v-else class="gp-sub">
+              Create a PIN so door staff can unlock Gate.
+            </p>
+            <div v-if="manageStaffPass" class="staff-pin">
+              {{ manageStaffPass }}
+            </div>
+            <div class="gp-row" style="margin-top: 12px;">
               <button
-                v-if="g.status === 'valid'"
-                class="gp-btn danger sm"
+                v-if="manageStaffPass"
+                class="gp-btn secondary"
                 type="button"
-                style="width: auto; padding: 6px 12px;"
-                @click="cancelTicketId = g.ticketId; voidTicket()"
+                @click="copyText(manageStaffPass, 'Door PIN copied')"
               >
-                Void
+                Copy PIN
+              </button>
+              <button
+                class="gp-btn"
+                :class="manageStaffPass || manageEvent.hasStaffPasscode ? 'secondary' : ''"
+                type="button"
+                :disabled="loading"
+                @click="generateManageStaffPin"
+              >
+                {{ manageStaffPass || manageEvent.hasStaffPasscode ? 'Change PIN' : 'Create PIN' }}
               </button>
             </div>
-            <div class="gp-mono">
-              {{ g.ticketId }}
-            </div>
-            <div v-if="g.tierName || g.seatLabel" class="gp-mono">
-              {{ [g.tierName, g.seatLabel].filter(Boolean).join(' · ') }}
-            </div>
-            <div class="gp-mono">
-              {{ g.buyerAddress }}
-            </div>
-          </li>
-        </ul>
-        <p v-if="waitlist.length" class="gp-banner" style="margin-top: 10px;">
-          Waitlist ({{ waitlist.length }}): {{ waitlist.map(w => w.address).join(', ') }}
-        </p>
-        <details class="gp-details">
-          <summary>Void by ticket id</summary>
-          <input v-model="cancelTicketId" class="gp-input" placeholder="ticket id">
-          <button class="gp-btn danger sm" type="button" :disabled="loading" @click="voidTicket">
-            Void ticket
-          </button>
-        </details>
-
-        <details class="gp-details">
-          <summary>Staff PIN + QR</summary>
-          <p class="gp-sub">
-            Generate a scannable staff QR, or set a custom PIN. Staff scan it in Gate → Unlock.
-          </p>
-          <button class="gp-btn secondary sm" type="button" :disabled="loading" @click="generateManageStaffPin">
-            Generate new PIN + QR
-          </button>
-          <label class="gp-label" style="margin-top: 12px;">Custom PIN</label>
-          <input
-            v-model="manageStaffPass"
-            class="gp-input"
-            placeholder="Or type a PIN, then save"
-            autocomplete="off"
-          >
-          <button class="gp-btn ghost sm" type="button" :disabled="loading" @click="saveStaffPass">
-            Save / clear (blank clears)
-          </button>
-          <div v-if="manageStaffQr" class="gp-qr" style="margin-top: 12px;">
-            <img :src="manageStaffQr" alt="Staff unlock QR" width="200" height="200">
           </div>
-        </details>
-      </div>
+
+          <div class="manage-block">
+            <div class="guest-head">
+              <h2 class="gp-h2">
+                Guests
+              </h2>
+              <button
+                v-if="guests.length"
+                type="button"
+                class="manage-link"
+                @click="exportCsv"
+              >
+                Export
+              </button>
+            </div>
+            <p v-if="!guests.length" class="gp-sub">
+              No tickets yet.
+            </p>
+            <ul v-if="guests.length" class="gp-list" style="margin-top: 8px;">
+              <li v-for="g in guests" :key="g.ticketId">
+                <div class="guest-row">
+                  <div>
+                    <strong style="text-transform: capitalize;">{{ g.status }}</strong>
+                    <div v-if="g.tierName || g.seatLabel" class="gp-mono">
+                      {{ [g.tierName, g.seatLabel].filter(Boolean).join(' · ') }}
+                    </div>
+                    <div class="gp-mono">
+                      {{ shortAddr(g.buyerAddress) }}
+                    </div>
+                  </div>
+                  <button
+                    v-if="g.status === 'valid'"
+                    class="gp-btn danger sm"
+                    type="button"
+                    style="width: auto; padding: 6px 12px;"
+                    @click="cancelTicketId = g.ticketId; voidTicket()"
+                  >
+                    Void
+                  </button>
+                </div>
+              </li>
+            </ul>
+            <p v-if="waitlist.length" class="gp-banner" style="margin-top: 10px;">
+              Waitlist ({{ waitlist.length }})
+            </p>
+          </div>
+        </div>
 
     </template>
 
-    <p v-if="status" class="gp-success">
-      {{ status }}
-    </p>
-    <p v-if="error" class="gp-error">
-      {{ error }}
-    </p>
+    <FlashBanner
+      v-if="status"
+      kind="success"
+      :message="status"
+      @clear="status = ''"
+    />
+    <FlashBanner
+      v-if="error"
+      :message="error"
+      @clear="error = ''"
+    />
   </section>
 </template>
 
 <style scoped>
+.host {
+  padding-bottom: calc(var(--gp-tabbar-h) + env(safe-area-inset-bottom, 0px) + 88px);
+}
 .host-tabs {
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr;
+}
+.manage-block {
+  margin-top: 18px;
+}
+.manage-block .gp-h2 {
+  margin-bottom: 4px;
+}
+.manage-back {
+  margin: -4px 0 10px;
+}
+.guest-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.guest-head .gp-h2 {
+  margin: 0;
+}
+.manage-links {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+}
+.manage-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--gp-muted);
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+.manage-link:disabled {
+  opacity: 0.38;
+}
+.guest-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.hall-book {
+  margin: 0 0 14px;
+}
+.hall-book__line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hall-book__next {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--gp-muted);
+}
+.hall-book__body {
+  padding: 0 2px 8px;
+}
+.hall-book[open] .hall-book__body {
+  background: rgba(233, 178, 19, 0.16);
+  border-radius: 16px;
+  padding: 12px 14px 14px;
+}
+.hall-book__body .gp-h2 {
+  margin: 0 0 6px;
+}
+.hall-book__body .gp-btn.secondary {
+  margin-top: 4px;
 }
 .tier-draft {
-  border: 1px solid var(--gp-border);
-  border-radius: 14px;
+  border: 0;
+  border-radius: 16px;
   padding: 12px;
   margin-bottom: 10px;
   background: var(--gp-surface-soft);
@@ -1059,12 +1421,12 @@ onMounted(() => {
   margin: 14px 0;
 }
 .share-step {
-  border: 1px solid var(--gp-border);
-  background: #fff;
+  border: 0;
+  background: var(--gp-surface-soft);
   border-radius: 12px;
   padding: 10px 6px;
   font-size: 0.72rem;
-  font-weight: 800;
+  font-weight: 500;
   color: var(--gp-muted);
 }
 .share-step.on {
@@ -1075,6 +1437,7 @@ onMounted(() => {
 .share-pane h3 {
   margin: 0 0 6px;
   font-size: 1.05rem;
+  font-weight: 500;
 }
 .share-pane p {
   margin: 0 0 12px;
@@ -1082,26 +1445,25 @@ onMounted(() => {
   font-size: 0.92rem;
   line-height: 1.4;
 }
-.manage-ev {
-  cursor: pointer;
-  border-radius: 12px;
-  margin: 0 -6px;
-  padding: 10px 6px !important;
-  transition: background 140ms var(--gp-ease);
-}
-.manage-ev.on {
-  background: rgba(233, 178, 19, 0.14);
+.manage-ev-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
 }
 .staff-pin {
   font-family: var(--gp-mono);
   font-size: 1.6rem;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: 0.2em;
   text-align: center;
   padding: 16px;
-  border-radius: 14px;
+  border-radius: 16px;
   background: rgba(233, 178, 19, 0.18);
   color: var(--gp-navy);
-  margin-bottom: 12px !important;
+  margin-top: 12px;
+  margin-bottom: 4px !important;
+  user-select: all;
+  -webkit-user-select: all;
 }
 </style>

@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@gatepass/shared": "*",
-    "@nimiq/mini-app-sdk": "^0.0.2",
+    "@nimiq/mini-app-sdk": "^0.1.0",
     "html5-qrcode": "^2.3.8",
     "qrcode": "^1.5.4",
     "vue": "^3.5.39"

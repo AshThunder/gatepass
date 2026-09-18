@@ -14,6 +14,7 @@ import {
   getInventory,
   getTicket,
   handleError,
+  hostUnlock,
   joinWaitlist,
   listEvents,
   listGuests,
@@ -25,8 +26,11 @@ import {
   staffUnlock,
   transferTicket,
 } from './routes/events.js'
+import { createChallenge, createSession, requireSession } from './routes/auth.js'
+import { listInbox, listOutbox } from './routes/inbox.js'
 import { getNetworkStatus } from './nimiq-rpc.js'
 import { SEAT_TEMPLATES } from './seat-templates.js'
+import { getHallInfo, rentHallSlot } from './halls.js'
 
 /** API routes — mounted at `/` (local) and `/api` (production SPA). */
 const api = new Hono()
@@ -46,6 +50,25 @@ api.get('/seat-templates', (c) => {
   return c.json({
     templates: Object.entries(SEAT_TEMPLATES).map(([id, meta]) => ({ id, ...meta })),
   })
+})
+
+api.get('/hall', (c) => {
+  try {
+    return c.json(getHallInfo())
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
+api.post('/hall/slots/:id/rent', async (c) => {
+  try {
+    const body = await c.req.json()
+    return c.json(await rentHallSlot(c.req.param('id'), body), 201)
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
 })
 
 api.get('/events', (c) => {
@@ -153,6 +176,16 @@ api.post('/events/:id/staff-unlock', async (c) => {
   }
 })
 
+api.post('/events/:id/host-unlock', (c) => {
+  try {
+    const session = requireSession(c.req.header('Authorization'))
+    return c.json(hostUnlock(c.req.param('id'), session.address))
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
 api.post('/events/:id/staff-passcode', async (c) => {
   try {
     const body = await c.req.json() as { unlockToken?: string, passcode?: string | null }
@@ -205,6 +238,26 @@ api.post('/events/:id/waitlist', async (c) => {
   }
 })
 
+api.get('/tickets/inbox', (c) => {
+  try {
+    const session = requireSession(c.req.header('Authorization'))
+    return c.json({ tickets: listInbox(session.address) })
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
+api.get('/tickets/outbox', (c) => {
+  try {
+    const session = requireSession(c.req.header('Authorization'))
+    return c.json({ transfers: listOutbox(session.address) })
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
 api.get('/tickets/:id', (c) => {
   try {
     return c.json({ ticket: getTicket(c.req.param('id')) })
@@ -243,7 +296,28 @@ api.post('/tickets/:id/transfer', async (c) => {
     const body = await c.req.json() as { toAddress?: string, fromAddress?: string }
     if (!body.toAddress)
       return c.json({ error: 'toAddress required' }, 400)
+    if (!body.fromAddress)
+      return c.json({ error: 'fromAddress required' }, 400)
     return c.json(await transferTicket(c.req.param('id'), body.toAddress, body.fromAddress))
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
+api.get('/auth/challenge', (c) => {
+  try {
+    return c.json(createChallenge())
+  }
+  catch (err) {
+    return handleError(err, c)
+  }
+})
+
+api.post('/auth/session', async (c) => {
+  try {
+    const body = await c.req.json()
+    return c.json(createSession(body), 201)
   }
   catch (err) {
     return handleError(err, c)
@@ -255,7 +329,7 @@ const app = new Hono()
 app.use('*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type'],
+  allowHeaders: ['Content-Type', 'Authorization'],
 }))
 
 app.route('/', api)

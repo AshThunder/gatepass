@@ -10,7 +10,7 @@ import {
 const address = ref('')
 const ready = ref(false)
 const busy = ref(false)
-let probeStarted = false
+let probePromise: Promise<void> | null = null
 
 function shortLabel(addr: string) {
   const clean = addr.replace(/\s+/g, '')
@@ -29,18 +29,25 @@ async function applyProvider(provider: NimiqProvider) {
 
 /** Silent boot probe — never flips busy / disables the header. */
 export async function probeWallet() {
-  if (probeStarted && ready.value)
+  if (ready.value)
     return
-  probeStarted = true
-  const provider = await tryConnectNimiq()
-  if (!provider)
-    return
-  try {
-    await applyProvider(provider)
+  if (!probePromise) {
+    probePromise = (async () => {
+      const provider = await tryConnectNimiq()
+      if (!provider)
+        return
+      try {
+        await applyProvider(provider)
+      }
+      catch {
+        ready.value = false
+      }
+    })().finally(() => {
+      if (!ready.value)
+        probePromise = null
+    })
   }
-  catch {
-    ready.value = false
-  }
+  return probePromise
 }
 
 export async function connectWallet() {

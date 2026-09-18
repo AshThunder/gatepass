@@ -13,7 +13,58 @@ export type TierKind = 'ga' | 'vip' | 'early_bird' | 'student' | 'group' | 'rese
 
 export type SeatStatus = 'available' | 'held' | 'sold'
 
-export type SeatTemplateId = 'theater-200' | 'club-80' | 'stadium-section'
+export type SeatTemplateId = 'theater-200' | 'club-80' | 'stadium-section' | 'nimiq-hall'
+
+export type HallSlotStatus = 'open' | 'held' | 'booked'
+
+export interface HallSlot {
+  id: string
+  startsAt: string
+  endsAt: string
+  rentLuna: number
+  status: HallSlotStatus
+  eventId: string | null
+  renterAddress: string | null
+}
+
+export interface HallInfo {
+  name: string
+  venueName: string
+  description: string
+  mapTemplate: SeatTemplateId
+  platformAddress: string | null
+  rentNim: number
+  /** Hard seat/guest cap for the hall */
+  capacity: number
+  /** Read-only seat diagram for preview (before renting) */
+  previewSeats: Array<{
+    label: string
+    rowKey: string
+    x: number
+    y: number
+  }>
+  slots: HallSlot[]
+}
+
+export interface RentHallRequest {
+  txHash: string
+  organizerAddress: string
+  title: string
+  description?: string
+  demo?: boolean
+  /** Ticket price in NIM for hall seats */
+  ticketPriceNim?: number
+  hideSoldCount?: boolean
+  hideRedeemedCount?: boolean
+}
+
+export interface RentHallResponse {
+  slot: HallSlot
+  event: EventRecord
+  eventMasterSecret: string
+  gateUnlockToken: string
+  staffPasscode: string | null
+}
 
 export interface TicketTier {
   id: string
@@ -79,6 +130,8 @@ export interface EventRecord {
   hideSoldCount: boolean
   /** Hide check-in counts from public Discover & event pages */
   hideRedeemedCount: boolean
+  /** Set when event was created by renting Nimiq Hall */
+  hallSlotId: string | null
   tiers: TicketTier[]
 }
 
@@ -135,6 +188,8 @@ export interface CreateEventRequest {
   hideSoldCount?: boolean
   /** Hide check-in count on public surfaces */
   hideRedeemedCount?: boolean
+  /** Linked Nimiq Hall slot when created via rent */
+  hallSlotId?: string | null
 }
 
 export interface CreateEventResponse {
@@ -171,6 +226,8 @@ export interface PurchaseResponse {
 export interface HoldRequest {
   buyerKey: string
   items: PurchaseItem[]
+  /** Existing hold to replace — lets Pay reuse seats this device already locked. */
+  holdId?: string
 }
 
 export interface HoldResponse {
@@ -218,6 +275,9 @@ export interface StaffUnlockResponse {
   bundle: GateBundle
 }
 
+/** Same shape as staff unlock — issued to the organizer session. */
+export type HostUnlockResponse = StaffUnlockResponse
+
 export interface GuestRow {
   ticketId: string
   buyerAddress: string
@@ -249,6 +309,11 @@ export function paymentMemo(eventId: string, quantity = 1): string {
   return quantity > 1 ? `GATEPASS:${eventId}:Q${quantity}` : `GATEPASS:${eventId}`
 }
 
+/** Memo for renting a Nimiq Hall slot */
+export function hallRentMemo(slotId: string): string {
+  return `GATEPASS:HALL:${slotId}`
+}
+
 /** Compact memo for multi-tier carts (qty = total tickets). */
 export function paymentMemoForCart(eventId: string, totalTickets: number): string {
   return paymentMemo(eventId, totalTickets)
@@ -265,6 +330,52 @@ export function mapsUrl(lat: number, lng: number): string {
 
 export function eventSharePath(eventId: string): string {
   return `?tab=discover&event=${encodeURIComponent(eventId)}`
+}
+
+/** Sender-facing transfer result — no live ticket seed. */
+export interface TicketTransferMeta {
+  toTicketId: string
+  toAddress: string
+  fromAddress: string
+  fromTicketId: string
+  eventId: string
+  eventTitle: string
+  tierId: string | null
+  tierName: string | null
+  seatLabel: string | null
+  createdAt: string
+}
+
+export interface TransferTicketResponse {
+  cancelledTicketId: string
+  transfer: TicketTransferMeta
+}
+
+export interface InboxTicket {
+  ticket: TicketRecord
+  event: EventRecord
+}
+
+export interface OutboxTransfer extends TicketTransferMeta {}
+
+export interface AuthChallengeResponse {
+  nonce: string
+  expiresAt: string
+}
+
+export interface AuthSessionRequest {
+  nonce: string
+  address: string
+  publicKey?: string
+  signature?: string
+  /** Allowed only when API SKIP_TX_VERIFY is on (local demo). */
+  demo?: boolean
+}
+
+export interface AuthSessionResponse {
+  token: string
+  address: string
+  expiresAt: string
 }
 
 export function tierOnSale(

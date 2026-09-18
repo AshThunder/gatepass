@@ -3,16 +3,31 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
 import AttendanceBadge from '@/components/AttendanceBadge.vue'
 import RotatingTicketQr from '@/components/RotatingTicketQr.vue'
+import FlashBanner from '@/components/FlashBanner.vue'
+import ResultDialog from '@/components/ResultDialog.vue'
 import { claimPendingTx, readPendingTx } from '@/lib/claimPending'
+import {
+  type Contact,
+  findContactByAddress,
+  listContacts,
+  removeContact,
+  upsertContact,
+} from '@/lib/contacts'
+import { appendSent, listSent, mergeOutbox, type SentRow } from '@/lib/sentTickets'
+import { demoInboxSession, ensureInboxSession } from '@/lib/session'
+import { isDemoAllowed } from '@/nimiq/wallet'
+import { useWallet } from '@/nimiq/useWallet'
 import {
   type EventRecord,
   type TicketRecord,
   isBadgePhase,
+  isNqAddress,
 } from '@gatepass/shared'
 
 interface Stored {
   ticket: TicketRecord
   event: EventRecord
+  origin?: 'purchased' | 'received'
 }
 
 interface EventGroup {
@@ -24,27 +39,56 @@ interface EventGroup {
   cancelledCount: number
 }
 
+type InboxTab = 'ready' | 'sent' | 'received'
 type Filter = 'ready' | 'all'
 
 const emit = defineEmits<{ browse: [] }>()
+const props = defineProps<{
+  visit?: number
+  active?: boolean
+}>()
+const { address: walletAddress, ready: walletReady } = useWallet()
 
 const items = ref<Stored[]>([])
+const sentItems = ref<SentRow[]>([])
+const contacts = ref<Contact[]>([])
 const selectedEventId = ref<string | null>(null)
 const activeId = ref('')
 const error = ref('')
 const status = ref('')
-const transferTo = ref('')
 const previewBadge = ref(false)
 const loading = ref(false)
+const inboxTab = ref<InboxTab>('ready')
+const showContacts = ref(false)
 const filter = ref<Filter>('ready')
 const showVoided = ref(false)
 const showTools = ref(false)
 const animKey = ref(0)
 const recoverMsg = ref('')
+const sendOpen = ref(false)
+const sendTo = ref('')
+const sendContactId = ref('')
+const contactName = ref('')
+const contactAddress = ref('')
+const contactEditId = ref('')
+const demoReceiveAs = ref('')
+const skipVerify = ref(false)
+const resultOpen = ref(false)
+const resultKind = ref<'success' | 'fail'>('success')
+const resultTitle = ref('')
+const resultMessage = ref('')
+const resultEvent = ref('')
+const resultTier = ref('')
+
+const liveItems = computed(() => {
+  if (inboxTab.value === 'received')
+    return items.value.filter(i => i.origin === 'received')
+  return items.value.filter(i => i.origin !== 'received')
+})
 
 const eventGroups = computed((): EventGroup[] => {
   const map = new Map<string, EventGroup>()
-  for (const item of items.value) {
+  for (const item of liveItems.value) {
     const id = item.event.id || item.ticket.eventId
     let g = map.get(id)
     if (!g) {
@@ -145,6 +189,15 @@ const readyInEvent = computed(() => selectedGroup.value?.readyCount ?? 0)
 const canPrev = computed(() => activeIndex.value > 0)
 const canNext = computed(() => activeIndex.value >= 0 && activeIndex.value < filtered.value.length - 1)
 
+const viewingPass = computed(() => !!selectedEventId.value && !showContacts.value)
+
+const needsPassFilter = computed(() => {
+  const g = selectedGroup.value
+  if (!g)
+    return false
+  return g.tickets.length > 1 || g.redeemedCount > 0 || g.cancelledCount > 0
+})
+
 function formatEventWhen(iso: string) {
   return new Date(iso).toLocaleString(undefined, {
     weekday: 'short',
@@ -153,6 +206,36 @@ function formatEventWhen(iso: string) {
     hour: 'numeric',
     minute: '2-digit',
   })
+}
+
+function showResult(
+  kind: 'success' | 'fail',
+  title: string,
+  message: string,
+  eventTitle = '',
+  tier = '',
+) {
+  resultKind.value = kind
+  resultTitle.value = title
+  resultMessage.value = message
+  resultEvent.value = eventTitle
+  resultTier.value = tier
+  resultOpen.value = true
+}
+
+function shortAddr(addr: string) {
+  const n = addr.replace(/\s+/g, '')
+  if (n.length < 12)
+    return addr
+  return `${n.slice(0, 6)}…${n.slice(-4)}`
+}
+
+function reloadContacts() {
+  contacts.value = listContacts()
+}
+
+function reloadSent() {
+  sentItems.value = listSent()
 }
 
 function persist() {
@@ -184,17 +267,24 @@ function loadLocal() {
     }
   }
 
+  reloadContacts()
+  reloadSent()
   selectedEventId.value = null
-  // After a purchase, jump straight into that event’s pass
   const pending = localStorage.getItem('gatepass:pendingOpenEvent')
   if (pending && eventGroups.value.some(g => g.eventId === pending)) {
     localStorage.removeItem('gatepass:pendingOpenEvent')
     openEvent(pending)
-    return
   }
-  // One event → open the pass immediately
-  if (eventGroups.value.length === 1)
-    openEvent(eventGroups.value[0]!.eventId)
+}
+
+function setInboxTab(tab: InboxTab) {
+  inboxTab.value = tab
+  showContacts.value = false
+  selectedEventId.value = null
+  previewBadge.value = false
+  showTools.value = false
+  error.value = ''
+  status.value = ''
 }
 
 function openEvent(eventId: string) {
@@ -212,13 +302,11 @@ function openEvent(eventId: string) {
 }
 
 function backToEvents() {
-  if (eventGroups.value.length <= 1) {
-    emit('browse')
-    return
-  }
   selectedEventId.value = null
   previewBadge.value = false
   showTools.value = false
+  showContacts.value = false
+  inboxTab.value = 'ready'
   error.value = ''
   status.value = ''
 }
@@ -263,26 +351,57 @@ function setFilter(nextFilter: Filter) {
 async function refreshActive() {
   if (!active.value)
     return
+  const id = active.value.ticket.id
   try {
-    const res = await api.getTicket(active.value.ticket.id)
+    const res = await api.getTicket(id)
     const idx = items.value.findIndex(i => i.ticket.id === res.ticket.id)
     if (idx >= 0)
       items.value[idx]!.ticket = res.ticket
     persist()
+    error.value = ''
   }
   catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/not found|404/i.test(msg)) {
+      items.value = items.value.filter(i => i.ticket.id !== id)
+      persist()
+      if (activeId.value === id)
+        activeId.value = filtered.value[0]?.ticket.id || eventTickets.value[0]?.ticket.id || ''
+      if (!eventTickets.value.length)
+        selectedEventId.value = null
+      error.value = 'That ticket is gone — removed from this device'
+    }
+    else {
+      error.value = msg
+    }
   }
 }
 
-async function transfer() {
+function openSend() {
+  if (!active.value || active.value.ticket.status !== 'valid')
+    return
+  sendContactId.value = contacts.value[0]?.id || ''
+  sendTo.value = contacts.value[0]?.address || ''
+  sendOpen.value = true
+  error.value = ''
+}
+
+function onPickContact(id: string) {
+  sendContactId.value = id
+  const c = contacts.value.find(x => x.id === id)
+  sendTo.value = c?.address || sendTo.value
+}
+
+function onSendContactChange(ev: Event) {
+  onPickContact((ev.target as HTMLSelectElement).value)
+}
+
+async function confirmSend() {
   if (!active.value)
     return
-  error.value = ''
-  status.value = ''
-  const to = transferTo.value.trim()
-  if (!to) {
-    error.value = 'Enter recipient NIM address'
+  const to = sendTo.value.trim()
+  if (!isNqAddress(to)) {
+    showResult('fail', 'Couldn’t send', 'Enter a valid NQ address or pick a contact.', active.value.event.title, active.value.ticket.tierName || '')
     return
   }
   loading.value = true
@@ -292,17 +411,105 @@ async function transfer() {
       to,
       active.value.ticket.buyerAddress,
     )
-    const idx = items.value.findIndex(i => i.ticket.id === res.cancelledTicketId)
-    const event = active.value.event
-    if (idx >= 0)
-      items.value.splice(idx, 1)
-    items.value.unshift({ ticket: res.ticket, event })
-    activeId.value = res.ticket.id
-    transferTo.value = ''
-    showTools.value = false
+    items.value = items.value.filter(i => i.ticket.id !== res.cancelledTicketId)
+    appendSent({
+      transfer: res.transfer,
+      contactName: findContactByAddress(to)?.name || null,
+    })
+    reloadSent()
     persist()
-    status.value = 'Ticket transferred'
-    void bumpAnim()
+    sendOpen.value = false
+    showTools.value = false
+    selectedEventId.value = null
+    inboxTab.value = 'sent'
+    showResult(
+      'success',
+      'Pass sent',
+      `Forwarded to ${findContactByAddress(to)?.name || shortAddr(to)}.`,
+      res.transfer.eventTitle,
+      res.transfer.tierName || '',
+    )
+  }
+  catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    showResult('fail', 'Couldn’t send', msg, active.value.event.title, active.value.ticket.tierName || '')
+  }
+  finally {
+    loading.value = false
+  }
+}
+
+function saveContact() {
+  try {
+    upsertContact({
+      id: contactEditId.value || undefined,
+      name: contactName.value,
+      address: contactAddress.value,
+    })
+    contactName.value = ''
+    contactAddress.value = ''
+    contactEditId.value = ''
+    reloadContacts()
+    status.value = 'Contact saved'
+  }
+  catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function editContact(c: Contact) {
+  contactEditId.value = c.id
+  contactName.value = c.name
+  contactAddress.value = c.address
+}
+
+function deleteContact(id: string) {
+  removeContact(id)
+  reloadContacts()
+}
+
+let inboxSync: Promise<void> | null = null
+
+async function syncInbox(forceDemoAddress?: string) {
+  const addr = forceDemoAddress || walletAddress.value
+  if (!addr)
+    return
+  if (!forceDemoAddress && inboxSync)
+    return inboxSync
+  const run = doSyncInbox(addr, forceDemoAddress)
+  if (!forceDemoAddress)
+    inboxSync = run.finally(() => { inboxSync = null })
+  return run
+}
+
+async function doSyncInbox(addr: string, forceDemoAddress?: string) {
+  loading.value = true
+  try {
+    const session = forceDemoAddress
+      ? await demoInboxSession(forceDemoAddress)
+      : await ensureInboxSession(addr)
+    const inbox = await api.ticketInbox(session.token)
+    let added = 0
+    for (const row of inbox.tickets) {
+      if (items.value.some(i => i.ticket.id === row.ticket.id))
+        continue
+      items.value.unshift({ ticket: row.ticket, event: row.event, origin: 'received' })
+      added++
+    }
+    persist()
+    try {
+      const out = await api.ticketOutbox(session.token)
+      mergeOutbox(out.transfers.map(transfer => ({
+        transfer,
+        contactName: findContactByAddress(transfer.toAddress)?.name || null,
+      })))
+      reloadSent()
+    }
+    catch {
+      // outbox is optional
+    }
+    if (added)
+      status.value = `Received ${added} pass${added === 1 ? '' : 'es'}`
   }
   catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -310,6 +517,17 @@ async function transfer() {
   finally {
     loading.value = false
   }
+}
+
+async function pullDemoInbox() {
+  const addr = demoReceiveAs.value.trim() || contacts.value[0]?.address || ''
+  if (!addr) {
+    error.value = 'Pick a contact or paste the friend’s NQ address'
+    return
+  }
+  inboxTab.value = 'received'
+  showContacts.value = false
+  await syncInbox(addr)
 }
 
 watch(activeId, () => {
@@ -324,8 +542,28 @@ watch(filtered, (list) => {
     activeId.value = list[0]!.ticket.id
 })
 
+watch(
+  [() => props.active, walletReady, walletAddress],
+  ([active, ready, addr]) => {
+    if (active && ready && addr)
+      void syncInbox()
+  },
+  { immediate: true },
+)
+
+watch(() => props.visit, (_n, prev) => {
+  if (prev !== undefined)
+    backToEvents()
+})
+
 onMounted(async () => {
   loadLocal()
+  try {
+    skipVerify.value = (await api.network()).skipTxVerify
+  }
+  catch {
+    skipVerify.value = false
+  }
   if (readPendingTx()) {
     recoverMsg.value = 'Checking a previous payment…'
     const res = await claimPendingTx()
@@ -338,6 +576,10 @@ onMounted(async () => {
     }
     else if (res.error) {
       recoverMsg.value = `Couldn’t claim yet: ${res.error}`
+      setTimeout(() => {
+        if (recoverMsg.value.startsWith('Couldn’t claim'))
+          recoverMsg.value = ''
+      }, 6500)
     }
     else {
       recoverMsg.value = ''
@@ -348,36 +590,162 @@ onMounted(async () => {
 
 <template>
   <section class="wallet">
-    <!-- Step 1: pick event -->
-    <template v-if="!selectedEventId">
-      <header class="wallet__head">
-        <div>
-          <p class="wallet__eyebrow">
-            Tickets
-          </p>
-          <h1 class="wallet__title">
-            Choose event
-          </h1>
-        </div>
-        <div v-if="items.length" class="wallet__count">
-          <strong>{{ eventGroups.length }}</strong>
-          <span>{{ eventGroups.length === 1 ? 'event' : 'events' }}</span>
-        </div>
-      </header>
+    <header v-if="!viewingPass" class="wallet__head">
+      <div>
+        <p class="wallet__eyebrow">
+          Tickets
+        </p>
+        <h1 class="wallet__title">
+          {{ showContacts ? 'Contacts' : inboxTab === 'sent' ? 'Sent' : inboxTab === 'received' ? 'Received' : 'Ready' }}
+        </h1>
+      </div>
+    </header>
 
+    <div
+      v-if="!viewingPass"
+      class="gp-filters"
+      role="tablist"
+      aria-label="Ticket inbox"
+    >
+      <button type="button" role="tab" :class="{ active: !showContacts && inboxTab === 'ready' }" @click="setInboxTab('ready')">
+        Ready
+      </button>
+      <button type="button" role="tab" :class="{ active: !showContacts && inboxTab === 'sent' }" @click="setInboxTab('sent')">
+        Sent
+      </button>
+      <button type="button" role="tab" :class="{ active: !showContacts && inboxTab === 'received' }" @click="setInboxTab('received')">
+        Received
+      </button>
+      <button type="button" role="tab" :class="{ active: showContacts }" @click="showContacts = !showContacts">
+        Contacts
+      </button>
+    </div>
+
+    <p v-if="recoverMsg" class="gp-banner">
+      {{ recoverMsg }}
+    </p>
+
+    <FlashBanner
+      v-if="status"
+      kind="success"
+      :message="status"
+      @clear="status = ''"
+    />
+    <FlashBanner
+      v-if="error"
+      :message="error"
+      @clear="error = ''"
+    />
+
+    <template v-if="showContacts">
       <p class="wallet__lead">
-        Select an event to open its pass.
+        Saved locally on this device — never sent to the server.
+      </p>
+      <label class="gp-label" for="contact-name">Name</label>
+      <input id="contact-name" v-model="contactName" class="gp-input" placeholder="Alex">
+      <label class="gp-label" for="contact-addr">Nimiq address</label>
+      <input id="contact-addr" v-model="contactAddress" class="gp-input" placeholder="NQ…">
+      <button class="gp-btn sm" type="button" style="margin: 10px 0 16px;" @click="saveContact">
+        {{ contactEditId ? 'Update contact' : 'Save contact' }}
+      </button>
+      <ul v-if="contacts.length" class="contact-list">
+        <li v-for="c in contacts" :key="c.id" class="contact-row">
+          <div>
+            <strong>{{ c.name }}</strong>
+            <p>{{ shortAddr(c.address) }}</p>
+          </div>
+          <div class="contact-row__actions">
+            <button class="gp-btn ghost sm" type="button" @click="editContact(c)">
+              Edit
+            </button>
+            <button class="gp-btn ghost sm" type="button" @click="deleteContact(c.id)">
+              Delete
+            </button>
+          </div>
+        </li>
+      </ul>
+      <p v-else class="wallet__none">
+        No contacts yet.
+      </p>
+    </template>
+
+    <template v-else-if="inboxTab === 'sent'">
+      <p class="wallet__lead">
+        Passes you forwarded. Friends open Received after Connect.
+      </p>
+      <ul v-if="sentItems.length" class="sent-list">
+        <li v-for="row in sentItems" :key="row.transfer.toTicketId" class="sent-card">
+          <p class="sent-card__when">
+            {{ formatEventWhen(row.transfer.createdAt) }}
+          </p>
+          <h2>{{ row.transfer.eventTitle }}</h2>
+          <p>
+            {{ row.transfer.tierName || 'Ticket' }}
+            <template v-if="row.transfer.seatLabel">
+              · {{ row.transfer.seatLabel }}
+            </template>
+          </p>
+          <p class="sent-card__to">
+            To {{ row.contactName || shortAddr(row.transfer.toAddress) }}
+          </p>
+        </li>
+      </ul>
+      <p v-else class="wallet__none">
+        Nothing sent yet.
+      </p>
+    </template>
+
+    <template v-else-if="!selectedEventId">
+      <p class="wallet__lead">
+        {{ inboxTab === 'received' ? 'Passes sent to this wallet.' : 'Select an event to open its pass.' }}
       </p>
 
-      <div v-if="!items.length" class="wallet__empty">
+      <div v-if="isDemoAllowed() && skipVerify" class="demo-pull">
+        <label class="gp-label" for="demo-receive">Local demo — pull inbox as</label>
+        <select
+          v-if="contacts.length"
+          id="demo-receive"
+          v-model="demoReceiveAs"
+          class="gp-input"
+        >
+          <option value="">
+            Pick a contact
+          </option>
+          <option v-for="c in contacts" :key="c.id" :value="c.address">
+            {{ c.name }}
+          </option>
+        </select>
+        <input
+          v-else
+          id="demo-receive"
+          v-model="demoReceiveAs"
+          class="gp-input"
+          placeholder="Friend NQ address"
+        >
+        <button class="gp-btn secondary sm" type="button" :disabled="loading" @click="pullDemoInbox">
+          {{ loading ? 'Pulling…' : 'Pull received' }}
+        </button>
+      </div>
+
+      <div v-if="!liveItems.length" class="wallet__empty">
         <div class="hex" aria-hidden="true">
           <svg viewBox="0 0 32 32" width="48" height="48">
             <path fill="#E9B213" d="M16 2.5 28 9.5v13L16 29.5 4 22.5v-13L16 2.5Z" />
           </svg>
         </div>
-        <h2>Nothing here yet</h2>
-        <p>Buy from Discover — your pass opens here right after payment.</p>
-        <button class="gp-btn secondary sm" type="button" style="margin-top: 8px; max-width: 220px;" @click="emit('browse')">
+        <h2>{{ inboxTab === 'received' ? 'Inbox empty' : 'Nothing here yet' }}</h2>
+        <p>
+          {{ inboxTab === 'received'
+            ? 'Connect (or pull as a contact in demo) to load passes sent to you.'
+            : 'Buy from Discover — your pass opens here right after payment.' }}
+        </p>
+        <button
+          v-if="inboxTab === 'ready'"
+          class="gp-btn sm"
+          type="button"
+          style="margin-top: 8px; max-width: 220px;"
+          @click="emit('browse')"
+        >
           Browse events
         </button>
       </div>
@@ -405,8 +773,12 @@ onMounted(async () => {
               </p>
               <p class="event-card__meta">
                 {{ g.tickets.length }} ticket{{ g.tickets.length === 1 ? '' : 's' }}
-                <template v-if="g.redeemedCount"> · {{ g.redeemedCount }} in</template>
-                <template v-if="g.cancelledCount"> · {{ g.cancelledCount }} void</template>
+                <template v-if="g.redeemedCount">
+                  · {{ g.redeemedCount }} in
+                </template>
+                <template v-if="g.cancelledCount">
+                  · {{ g.cancelledCount }} void
+                </template>
               </p>
             </div>
             <span class="event-card__chev" aria-hidden="true">›</span>
@@ -417,30 +789,21 @@ onMounted(async () => {
 
     <!-- Step 2: pass for selected event -->
     <template v-else>
-      <button class="wallet__back" type="button" @click="backToEvents">
-        {{ eventGroups.length > 1 ? '← Events' : '← Discover' }}
-      </button>
+      <div class="pass-bar">
+        <button class="wallet__back" type="button" @click="backToEvents">
+          ← Events
+        </button>
+        <p v-if="needsPassFilter && readyInEvent" class="pass-bar__count">
+          {{ readyInEvent }} ready
+        </p>
+      </div>
 
-      <header class="wallet__head">
-        <div>
-          <p class="wallet__eyebrow">
-            {{ selectedGroup?.event.venueName }}
-          </p>
-          <h1 class="wallet__title">
-            {{ selectedGroup?.event.title }}
-          </h1>
-        </div>
-        <div class="wallet__count">
-          <strong>{{ readyInEvent }}</strong>
-          <span>ready</span>
-        </div>
-      </header>
-
-      <p v-if="recoverMsg" class="gp-banner">
-        {{ recoverMsg }}
-      </p>
-
-      <div class="gp-filters" role="tablist" aria-label="Ticket filters">
+      <div
+        v-if="needsPassFilter"
+        class="gp-filters"
+        role="tablist"
+        aria-label="Passes for this event"
+      >
         <button type="button" role="tab" :class="{ active: filter === 'ready' }" @click="setFilter('ready')">
           Ready
         </button>
@@ -448,7 +811,7 @@ onMounted(async () => {
           All ({{ showVoided ? eventTickets.length : eventTickets.length - voidedInEvent }})
         </button>
       </div>
-      <label v-if="filter === 'all' && voidedInEvent" class="gp-check">
+      <label v-if="needsPassFilter && filter === 'all' && voidedInEvent" class="gp-check">
         <input v-model="showVoided" type="checkbox">
         Show voided ({{ voidedInEvent }})
       </label>
@@ -535,6 +898,15 @@ onMounted(async () => {
               :ticket-id="active.ticket.id"
               :ticket-seed="active.ticket.ticketSeed"
             />
+            <button
+              v-if="inboxTab === 'ready'"
+              class="gp-btn sm"
+              type="button"
+              style="margin-top: 12px; max-width: 220px;"
+              @click="openSend"
+            >
+              Send
+            </button>
           </div>
 
           <div v-else-if="active.ticket.status === 'redeemed'" class="pass__body used">
@@ -571,6 +943,14 @@ onMounted(async () => {
         </article>
 
         <div v-if="showTools && !showBadge" class="wallet__tools">
+          <button
+            v-if="active.ticket.status === 'valid' && inboxTab === 'ready'"
+            class="gp-btn sm"
+            type="button"
+            @click="openSend"
+          >
+            Send to a friend
+          </button>
           <button class="gp-btn ghost sm" type="button" @click="refreshActive">
             Refresh status
           </button>
@@ -582,23 +962,73 @@ onMounted(async () => {
           >
             Badge preview
           </button>
-          <div v-if="active.ticket.status === 'valid'" class="transfer">
-            <label class="gp-label">Transfer to</label>
-            <input v-model="transferTo" class="gp-input" placeholder="NQ…">
-            <button class="gp-btn secondary sm" type="button" :disabled="loading" @click="transfer">
-              {{ loading ? 'Transferring…' : 'Transfer' }}
-            </button>
-          </div>
         </div>
 
-        <p v-if="status" class="gp-success">
-          {{ status }}
-        </p>
-        <p v-if="error" class="gp-error">
-          {{ error }}
-        </p>
+        <FlashBanner
+          v-if="status && selectedEventId"
+          kind="success"
+          :message="status"
+          @clear="status = ''"
+        />
+        <FlashBanner
+          v-if="error && selectedEventId"
+          :message="error"
+          @clear="error = ''"
+        />
       </template>
     </template>
+
+    <div v-if="sendOpen" class="send-sheet" @click.self="sendOpen = false">
+      <div v-if="active" class="send-dialog__card">
+        <h2 class="gp-h2">
+          Send pass
+        </h2>
+        <p class="result-meta">
+          {{ active.event.title }}
+          <template v-if="active.ticket.tierName">
+            · {{ active.ticket.tierName }}
+          </template>
+          <template v-if="active.ticket.seatLabel">
+            · {{ active.ticket.seatLabel }}
+          </template>
+        </p>
+        <label v-if="contacts.length" class="gp-label" for="send-contact">Contact</label>
+        <select
+          v-if="contacts.length"
+          id="send-contact"
+          class="gp-input"
+          :value="sendContactId"
+          @change="onSendContactChange($event)"
+        >
+          <option value="">
+            Paste an address instead
+          </option>
+          <option v-for="c in contacts" :key="c.id" :value="c.id">
+            {{ c.name }}
+          </option>
+        </select>
+        <label class="gp-label" for="send-to">Nimiq address</label>
+        <input id="send-to" v-model="sendTo" class="gp-input" placeholder="NQ…">
+        <div class="send-dialog__actions">
+          <button class="gp-btn ghost sm" type="button" @click="sendOpen = false">
+            Cancel
+          </button>
+          <button class="gp-btn sm" type="button" :disabled="loading" @click="confirmSend">
+            {{ loading ? 'Sending…' : 'Send' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <ResultDialog
+      :open="resultOpen"
+      :kind="resultKind"
+      :title="resultTitle"
+      :message="resultMessage"
+      :event-title="resultEvent"
+      :tier="resultTier"
+      @close="resultOpen = false"
+    />
   </section>
 </template>
 
@@ -612,18 +1042,17 @@ onMounted(async () => {
 }
 .wallet__eyebrow {
   margin: 0 0 2px;
-  font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
   color: var(--gp-muted);
 }
 .wallet__title {
   margin: 0;
-  font-size: 1.55rem;
-  letter-spacing: -0.04em;
-  font-weight: 800;
-  line-height: 1.15;
+  font-size: 1.75rem;
+  letter-spacing: 0;
+  font-weight: 400;
+  line-height: 1.2;
 }
 .wallet__lead {
   margin: 0 0 16px;
@@ -642,28 +1071,43 @@ onMounted(async () => {
 }
 .wallet__count span {
   font-size: 0.72rem;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  font-weight: 500;
+  letter-spacing: 0.04em;
   color: var(--gp-muted);
 }
 
 .wallet__back {
   border: 0;
   background: transparent;
-  padding: 0 0 10px;
-  font-weight: 800;
-  font-size: 0.9rem;
+  padding: 0;
+  min-height: var(--gp-tap);
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--gp-navy);
+}
+
+.pass-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px 0 8px;
+}
+.pass-bar__count {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--gp-muted);
 }
 
 .wallet__empty {
   text-align: center;
   padding: 48px 20px 36px;
-  border-radius: 24px;
+  border-radius: 16px;
   background: linear-gradient(165deg, #252a55 0%, #1f2348 55%, #151833 100%);
   color: #fff;
-  box-shadow: 0 18px 40px rgba(31, 35, 72, 0.28);
+  box-shadow: none;
 }
 .wallet__empty h2 {
   margin: 12px 0 8px;
@@ -690,22 +1134,37 @@ onMounted(async () => {
   gap: 10px;
 }
 .event-card {
+  position: relative;
+  overflow: hidden;
   width: 100%;
   display: grid;
   grid-template-columns: 76px 1fr 20px;
   gap: 12px;
   align-items: stretch;
   text-align: left;
-  border: 1px solid var(--gp-border);
-  background: #fff;
-  border-radius: 18px;
+  border: 0;
+  background: var(--gp-surface);
+  border-radius: 16px;
   padding: 10px;
+  min-height: var(--gp-tap);
   color: var(--gp-navy);
-  box-shadow: var(--gp-shadow);
-  transition: transform 140ms var(--gp-ease);
+  box-shadow: none;
+  transition: background 140ms var(--gp-ease);
+}
+.event-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: currentColor;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms var(--gp-ease);
+}
+.event-card:active::after {
+  opacity: 0.08;
 }
 .event-card:active {
-  transform: scale(0.985);
+  background: var(--gp-surface-soft);
 }
 .event-card__media {
   width: 76px;
@@ -733,18 +1192,17 @@ onMounted(async () => {
   flex: 1;
   min-width: 0;
   font-size: 1.05rem;
-  letter-spacing: -0.02em;
-  font-weight: 800;
+  letter-spacing: 0;
+  font-weight: 500;
   line-height: 1.2;
 }
 .pill {
   flex-shrink: 0;
   font-size: 0.65rem;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-weight: 500;
+  letter-spacing: 0.02em;
   padding: 4px 8px;
-  border-radius: 999px;
+  border-radius: 8px;
 }
 .pill.ready {
   background: rgba(33, 188, 165, 0.16);
@@ -773,7 +1231,7 @@ onMounted(async () => {
 .event-card__meta {
   margin-top: 6px;
   font-size: 0.75rem;
-  font-weight: 700;
+  font-weight: 500;
 }
 .event-card__chev {
   align-self: center;
@@ -785,25 +1243,28 @@ onMounted(async () => {
 .wallet__filters {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 4px;
+  gap: 0;
   padding: 4px;
-  border-radius: 14px;
-  background: rgba(31, 35, 72, 0.07);
+  border-radius: 20px;
+  background: var(--gp-surface-high);
   margin-bottom: 12px;
 }
 .wallet__filters button {
+  position: relative;
+  overflow: hidden;
   border: 0;
   background: transparent;
-  border-radius: 11px;
+  border-radius: 16px;
+  min-height: 40px;
   padding: 10px;
-  font-weight: 800;
-  font-size: 0.88rem;
+  font-weight: 500;
+  font-size: 0.875rem;
   color: var(--gp-muted);
 }
 .wallet__filters button.on {
-  background: #fff;
+  background: var(--gp-surface);
   color: var(--gp-navy);
-  box-shadow: 0 2px 10px rgba(31, 35, 72, 0.1);
+  box-shadow: none;
 }
 
 .wallet__none {
@@ -820,13 +1281,13 @@ onMounted(async () => {
   margin-bottom: 10px;
 }
 .nav-btn {
-  width: 44px;
-  height: 44px;
-  border-radius: 14px;
+  width: var(--gp-tap);
+  height: var(--gp-tap);
+  border-radius: 16px;
   border: 1px solid var(--gp-border);
   background: #fff;
   font-size: 1.5rem;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--gp-navy);
   line-height: 1;
 }
@@ -851,7 +1312,7 @@ onMounted(async () => {
 }
 .wallet__index {
   font-size: 0.78rem;
-  font-weight: 800;
+  font-weight: 500;
   color: var(--gp-muted);
   letter-spacing: 0.04em;
 }
@@ -1099,5 +1560,83 @@ onMounted(async () => {
   .hex {
     animation: none !important;
   }
+}
+
+.contact-list,
+.sent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.contact-row,
+.sent-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--gp-surface);
+}
+.contact-row p,
+.sent-card p {
+  margin: 4px 0 0;
+  color: var(--gp-muted);
+  font-size: 0.82rem;
+}
+.contact-row strong,
+.sent-card h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.contact-row__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.sent-card {
+  display: block;
+}
+.sent-card__when,
+.sent-card__to {
+  font-size: 0.78rem !important;
+}
+.demo-pull {
+  margin: 0 0 16px;
+  padding: 12px;
+  border-radius: 16px;
+  background: var(--gp-surface-soft);
+}
+.send-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: end center;
+  padding: 16px 16px 88px;
+  background: rgba(31, 35, 72, 0.4);
+}
+.send-dialog__card {
+  width: min(420px, 100%);
+  border-radius: 16px;
+  padding: 20px 16px 16px;
+  background: var(--gp-surface);
+  box-shadow: 0 8px 32px rgba(31, 35, 72, 0.24);
+}
+.result-meta {
+  margin: 0 0 12px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--gp-navy);
+}
+.send-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
 }
 </style>

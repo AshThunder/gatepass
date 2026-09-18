@@ -3,8 +3,12 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
 import TierPicker from '@/components/TierPicker.vue'
 import SeatMap from '@/components/SeatMap.vue'
-import { connectNimiq, isDemoAllowed, payForTicket } from '@/nimiq/wallet'
+import FlashBanner from '@/components/FlashBanner.vue'
+import { connectNimiq, ensureConsensus, isDemoAllowed, payForTicket, toErrorMessage } from '@/nimiq/wallet'
 import { useWallet } from '@/nimiq/useWallet'
+import { newId } from '@/lib/id'
+import { copyToClipboard } from '@/lib/copy'
+import ResultDialog from '@/components/ResultDialog.vue'
 import {
   clearReminder,
   hasReminder,
@@ -37,9 +41,52 @@ const quantity = ref(1)
 const selectedTierId = ref<string | null>(null)
 const selectedSeatIds = ref<string[]>([])
 const holdId = ref<string | null>(null)
+const holdExpiresAt = ref<string | null>(null)
+const holdSecondsLeft = ref(0)
 const reminded = ref(false)
 const successFlash = ref(false)
+const resultOpen = ref(false)
+const resultKind = ref<'success' | 'fail'>('success')
+const resultTitle = ref('')
+const resultMessage = ref('')
 let invPoll: ReturnType<typeof setInterval> | null = null
+let holdTimer: ReturnType<typeof setInterval> | null = null
+let holdDebounce: ReturnType<typeof setTimeout> | null = null
+
+const holdLabel = computed(() => {
+  if (!holdExpiresAt.value || holdSecondsLeft.value <= 0)
+    return ''
+  const m = Math.floor(holdSecondsLeft.value / 60)
+  const s = holdSecondsLeft.value % 60
+  return `Seats held · ${m}:${String(s).padStart(2, '0')}`
+})
+
+function clearHoldLocal() {
+  holdId.value = null
+  holdExpiresAt.value = null
+  holdSecondsLeft.value = 0
+  if (holdTimer) {
+    clearInterval(holdTimer)
+    holdTimer = null
+  }
+}
+
+function startHoldCountdown(expiresAt: string) {
+  holdExpiresAt.value = expiresAt
+  if (holdTimer)
+    clearInterval(holdTimer)
+  const tick = () => {
+    const left = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000))
+    holdSecondsLeft.value = left
+    if (left <= 0) {
+      clearHoldLocal()
+      selectedSeatIds.value = []
+      status.value = 'Hold expired — pick seats again'
+    }
+  }
+  tick()
+  holdTimer = setInterval(tick, 1000)
+}
 
 const { address, ready: providerReady, connect: connectShared, probe: probeWallet } = useWallet()
 
@@ -146,18 +193,49 @@ async function ensureWallet() {
 
 function persistTickets(tickets: TicketRecord[], ev: EventRecord) {
   const raw = localStorage.getItem('gatepass:myTickets')
-  let list: Array<{ ticket: TicketRecord, event: EventRecord }> = []
+  let list: Array<{ ticket: TicketRecord, event: EventRecord, origin?: string }> = []
   try {
     list = raw ? JSON.parse(raw) as typeof list : []
   }
   catch { list = [] }
   for (const t of tickets) {
     list = list.filter(x => x.ticket.id !== t.id)
-    list.unshift({ ticket: t, event: ev })
+    list.unshift({ ticket: t, event: ev, origin: 'purchased' })
   }
   localStorage.setItem('gatepass:myTickets', JSON.stringify(list.slice(0, 40)))
-  if (tickets[0])
-    localStorage.setItem('gatepass:myTicket', JSON.stringify({ ticket: tickets[0], event: ev }))
+  if (tickets[0]) {
+    localStorage.setItem(
+      'gatepass:myTicket',
+      JSON.stringify({ ticket: tickets[0], event: ev, origin: 'purchased' }),
+    )
+  }
+}
+
+function purchaseTierLabel() {
+  return selectedTier.value?.name || 'Ticket'
+}
+
+function purchaseAmountLabel() {
+  const nim = lunaToNim(totalLuna.value)
+  return nim === 0 ? 'Free' : `${nim} NIM`
+}
+
+function showResult(kind: 'success' | 'fail', title: string, message: string) {
+  resultKind.value = kind
+  resultTitle.value = title
+  resultMessage.value = message
+  resultOpen.value = true
+}
+
+let pendingPurchase: { tickets: TicketRecord[], event: EventRecord } | null = null
+
+function closeResult() {
+  resultOpen.value = false
+  if (pendingPurchase) {
+    const payload = pendingPurchase
+    pendingPurchase = null
+    emit('purchased', payload.tickets, payload.event)
+  }
 }
 
 async function ensureHold(buyerKey: string) {
@@ -168,12 +246,36 @@ async function ensureHold(buyerKey: string) {
     const hold = await api.createHold(event.value.id, {
       buyerKey,
       items: cartItems.value,
+      holdId: holdId.value || undefined,
     })
     holdId.value = hold.holdId
+    startHoldCountdown(hold.expiresAt)
     return hold
   }
-  holdId.value = null
+  clearHoldLocal()
   return null
+}
+
+async function refreshSeatHold() {
+  if (!event.value || !isReserved.value || !selectedSeatIds.value.length) {
+    clearHoldLocal()
+    return
+  }
+  try {
+    const buyer = address.value || 'NQ07 HOLD GUEST 0000 0000 0000 0000 0000'
+    const hold = await api.createHold(event.value.id, {
+      buyerKey: buyer,
+      items: cartItems.value,
+      holdId: holdId.value || undefined,
+    })
+    holdId.value = hold.holdId
+    startHoldCountdown(hold.expiresAt)
+    status.value = ''
+  }
+  catch (err) {
+    clearHoldLocal()
+    error.value = err instanceof Error ? err.message : String(err)
+  }
 }
 
 async function claimTickets(eventId: string, txHash: string, buyerAddress: string, demo = false) {
@@ -187,6 +289,11 @@ async function claimTickets(eventId: string, txHash: string, buyerAddress: strin
     quantity: ticketCount.value,
   })
   return res.tickets?.length ? res.tickets : [res.ticket]
+}
+
+function holdError(err: unknown) {
+  const msg = toErrorMessage(err)
+  return /held|taken|no longer available|select seats|hold expired/i.test(msg)
 }
 
 async function buyReal() {
@@ -207,6 +314,8 @@ async function buyReal() {
 
     await ensureHold(buyer)
 
+    status.value = 'Waiting for Nimiq Pay to sync…'
+    await ensureConsensus(provider)
     status.value = 'Approve payment in Nimiq Pay…'
     const txHash = await payForTicket(provider, {
       recipient: event.value.organizerAddress,
@@ -228,14 +337,23 @@ async function buyReal() {
     const issued = await claimTickets(event.value.id, txHash, buyer, false)
     persistTickets(issued, event.value)
     localStorage.removeItem('gatepass:pendingTx')
-    holdId.value = null
+    clearHoldLocal()
     status.value = `Success — ${issued.length} ticket(s) ready`
     successFlash.value = true
-    emit('purchased', issued, event.value)
+    showResult(
+      'success',
+      issued.length > 1 ? 'Tickets ready' : 'Ticket ready',
+      `${issued.length} pass${issued.length === 1 ? '' : 'es'} saved in Tickets.`,
+    )
+    pendingPurchase = { tickets: issued, event: event.value }
   }
   catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
     status.value = ''
+    showResult(
+      'fail',
+      holdError(err) ? 'Seat not available' : 'Payment didn’t go through',
+      toErrorMessage(err),
+    )
   }
   finally {
     loading.value = false
@@ -250,16 +368,26 @@ async function buyDemo() {
   try {
     const buyer = address.value || 'NQ07 DEMO BUYER 0000 0000 0000 0000 0000'
     await ensureHold(buyer)
-    const txHash = `demo-${crypto.randomUUID()}`
+    const txHash = `demo-${newId()}`
     const issued = await claimTickets(event.value.id, txHash, buyer, true)
     persistTickets(issued, event.value)
-    holdId.value = null
+    clearHoldLocal()
     status.value = `Success — ${issued.length} demo ticket(s)`
     successFlash.value = true
-    emit('purchased', issued, event.value)
+    showResult(
+      'success',
+      issued.length > 1 ? 'Demo tickets ready' : 'Demo ticket ready',
+      `${issued.length} pass${issued.length === 1 ? '' : 'es'} saved in Tickets.`,
+    )
+    pendingPurchase = { tickets: issued, event: event.value }
   }
   catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
+    status.value = ''
+    showResult(
+      'fail',
+      holdError(err) ? 'Seat not available' : 'Couldn’t issue demo ticket',
+      toErrorMessage(err),
+    )
   }
   finally {
     loading.value = false
@@ -276,13 +404,15 @@ async function claimPending() {
     const issued = await claimTickets(event.value.id, lastTxHash.value, buyer, false)
     persistTickets(issued, event.value)
     localStorage.removeItem('gatepass:pendingTx')
-    holdId.value = null
+    clearHoldLocal()
     status.value = 'Ticket(s) claimed from payment'
     successFlash.value = true
-    emit('purchased', issued, event.value)
+    showResult('success', 'Payment claimed', 'Your pass is in Tickets.')
+    pendingPurchase = { tickets: issued, event: event.value }
   }
   catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
+    showResult('fail', 'Couldn’t claim ticket', error.value)
   }
   finally {
     loading.value = false
@@ -340,6 +470,53 @@ const dateLabel = computed(() => {
   })
 })
 
+const calMonth = computed(() => {
+  if (!event.value)
+    return ''
+  return new Date(event.value.startsAt).toLocaleDateString(undefined, { month: 'short' }).toUpperCase()
+})
+
+const calDay = computed(() => {
+  if (!event.value)
+    return ''
+  return new Date(event.value.startsAt).toLocaleDateString(undefined, { day: 'numeric' })
+})
+
+function formatTime(d: Date) {
+  return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
+
+const whenLabel = computed(() => {
+  if (!event.value)
+    return ''
+  const start = new Date(event.value.startsAt)
+  const end = new Date(event.value.endsAt)
+  const day = start.toLocaleDateString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  })
+  if (start.toDateString() === end.toDateString())
+    return `${day} · ${formatTime(start)} – ${formatTime(end)}`
+  return `${dateLabel.value} – ${end.toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })}`
+})
+
+const showDescription = computed(() => {
+  const d = event.value?.description?.trim() || ''
+  if (!d)
+    return false
+  const title = event.value?.title.trim() || ''
+  const venue = event.value?.venueName.trim() || ''
+  const fold = (s: string) => s.replace(/\s+/g, ' ').toLowerCase()
+  return fold(d) !== fold(title) && fold(d) !== fold(venue)
+})
+
 const unitPrice = computed(() => {
   if (!selectedTier.value)
     return event.value ? `${lunaToNim(event.value.priceLuna)} NIM` : '—'
@@ -359,19 +536,31 @@ function bumpQty(delta: number) {
 function onSelectTier(id: string) {
   selectedTierId.value = id
   selectedSeatIds.value = []
-  holdId.value = null
+  clearHoldLocal()
   const t = event.value?.tiers.find(x => x.id === id)
   quantity.value = Math.max(1, t?.perOrderMin || 1)
 }
 
 async function copyShare() {
-  try {
-    await navigator.clipboard.writeText(shareUrl.value)
-    status.value = 'Event link copied'
+  const ok = await copyToClipboard(shareUrl.value)
+  status.value = ok ? 'Event link copied' : 'Could not copy — long-press to copy'
+}
+
+async function shareEvent() {
+  if (!event.value)
+    return
+  if (navigator.share) {
+    try {
+      await navigator.share({
+        title: event.value.title,
+        text: `${event.value.title} · ${whenLabel.value} · ${event.value.venueName}`,
+        url: shareUrl.value,
+      })
+      return
+    }
+    catch { /* fall through */ }
   }
-  catch {
-    status.value = shareUrl.value
-  }
+  await copyShare()
 }
 
 onMounted(async () => {
@@ -408,6 +597,29 @@ onMounted(async () => {
 onUnmounted(() => {
   if (invPoll)
     clearInterval(invPoll)
+  if (holdTimer)
+    clearInterval(holdTimer)
+  if (holdDebounce)
+    clearTimeout(holdDebounce)
+})
+
+watch(selectedSeatIds, () => {
+  if (!isReserved.value)
+    return
+  if (holdDebounce)
+    clearTimeout(holdDebounce)
+  if (!selectedSeatIds.value.length) {
+    clearHoldLocal()
+    return
+  }
+  holdDebounce = setTimeout(() => {
+    void refreshSeatHold()
+  }, 450)
+})
+
+watch(address, () => {
+  if (isReserved.value && selectedSeatIds.value.length)
+    void refreshSeatHold()
 })
 
 watch(() => props.eventId, () => {
@@ -417,158 +629,169 @@ watch(() => props.eventId, () => {
 
 <template>
   <section class="detail-page">
-    <button class="gp-back" type="button" @click="emit('back')">
-      ← Discover
-    </button>
-
-    <div v-if="successFlash" class="gp-toast" role="status">
-      <span class="gp-pill ok">Purchase complete</span>
-      <p class="gp-sub" style="margin: 8px 0 0;">
-        Your ticket(s) are in the Tickets tab.
-      </p>
-    </div>
+    <ResultDialog
+      :open="resultOpen"
+      :kind="resultKind"
+      :title="resultTitle"
+      :message="resultMessage"
+      :event-title="event?.title"
+      :tier="purchaseTierLabel()"
+      :amount="purchaseAmountLabel()"
+      @close="closeResult"
+    />
 
     <div v-if="!event" class="gp-card soft">
+      <button class="gp-back" type="button" @click="emit('back')">
+        ← Discover
+      </button>
       <p class="gp-sub" style="margin: 0;">
         Loading event…
       </p>
     </div>
 
     <template v-else>
-      <div class="gp-card flush detail">
-        <div
-          class="cover"
-          :class="{ placeholder: !event.coverUrl }"
-          :style="event.coverUrl ? { backgroundImage: `url(${event.coverUrl})` } : undefined"
-        />
-        <div class="detail__body">
-          <div class="gp-chip-row">
-            <span class="gp-pill">{{ dateLabel }}</span>
-            <span v-if="event.soldOut" class="gp-pill warn">Sold out</span>
-            <span v-else-if="isPast" class="gp-pill warn">Ended</span>
-            <span v-else class="gp-pill ok">{{ unitPrice }}</span>
-          </div>
-          <h1 class="gp-page-title">
-            {{ event.title }}
-          </h1>
-          <p class="gp-page-sub" style="margin-bottom: 8px;">
-            {{ event.venueName }}
-          </p>
-          <p v-if="event.description" class="gp-sub">
-            {{ event.description }}
-          </p>
-
-          <div class="gp-stat-grid">
-            <div class="gp-stat">
-              <strong>{{ unitPrice }}</strong>
-              <span>{{ event.tiers.length > 1 ? 'from' : 'each' }}</span>
-            </div>
-            <div class="gp-stat">
-              <strong>{{ selectedTier?.remaining != null ? selectedTier.remaining : (event.remaining != null ? event.remaining : '∞') }}</strong>
-              <span>{{ event.soldOut ? 'sold out' : 'left' }}</span>
-            </div>
-            <div v-if="!event.hideSoldCount" class="gp-stat">
-              <strong>{{ event.soldCount }}</strong>
-              <span>going</span>
-            </div>
-            <div v-else class="gp-stat">
-              <strong>{{ event.tiers.length }}</strong>
-              <span>tier{{ event.tiers.length === 1 ? '' : 's' }}</span>
-            </div>
-            <div v-if="!event.hideRedeemedCount" class="gp-stat">
-              <strong>{{ event.redeemedCount }}</strong>
-              <span>checked in</span>
-            </div>
-          </div>
-
-          <div class="gp-row" style="margin-bottom: 4px;">
-            <button class="gp-btn ghost sm" type="button" @click="copyShare">
+      <div class="detail">
+        <div class="detail__nav">
+          <button class="gp-back" type="button" @click="emit('back')">
+            ← Discover
+          </button>
+          <div class="detail__nav-actions">
+            <button class="detail-link" type="button" @click="shareEvent">
               Share
             </button>
-            <button class="gp-btn ghost sm" type="button" @click="toggleReminder">
-              {{ reminded ? 'Reminder on' : 'Remind me' }}
+            <button class="detail-link" type="button" @click="toggleReminder">
+              {{ reminded ? 'Reminder on' : 'Remind' }}
             </button>
-            <a
-              v-if="event.venueLat != null && event.venueLng != null"
-              class="gp-btn ghost sm"
-              :href="mapsUrl(event.venueLat, event.venueLng)"
-              target="_blank"
-              rel="noopener"
-            >Map</a>
           </div>
-
-          <div v-if="!isPast && !event.soldOut && !lastTxHash" class="detail__purchase">
-            <label class="gp-label">Ticket type</label>
-            <TierPicker
-              :tiers="event.tiers"
-              :selected-id="selectedTierId"
-              @select="onSelectTier"
-            />
-
-            <SeatMap
-              v-if="isReserved && selectedTierId"
-              v-model="selectedSeatIds"
-              :event-id="event.id"
-              :tier-id="selectedTierId"
-            />
-
-            <template v-else-if="selectedTier && !isReserved">
-              <label class="gp-label">Quantity</label>
-              <div class="gp-qty">
-                <button type="button" :disabled="quantity <= selectedTier.perOrderMin" @click="bumpQty(-1)">
-                  −
-                </button>
-                <strong>{{ quantity }}</strong>
-                <button
-                  type="button"
-                  :disabled="tierRemaining != null && quantity >= Math.min(selectedTier.perOrderMax, tierRemaining)"
-                  @click="bumpQty(1)"
-                >
-                  +
-                </button>
-              </div>
-            </template>
-
-            <details v-if="isDemoAllowed()" class="gp-details">
-              <summary>More options</summary>
-              <button
-                class="gp-btn ghost sm"
-                :disabled="loading || !canBuy"
-                type="button"
-                @click="buyDemo"
-              >
-                Get demo ticket(s)
-              </button>
-            </details>
-          </div>
-
-          <details class="gp-details">
-            <summary>Payment details</summary>
-            <div class="gp-banner">
-              <div class="gp-mono">Organizer {{ event.organizerAddress }}</div>
-              <div class="gp-mono" style="margin-top: 6px;">
-                Memo {{ paymentMemo(event.id, ticketCount) }}
-              </div>
-              <div v-if="event.waitlistCount" class="gp-mono" style="margin-top: 6px;">
-                {{ event.waitlistCount }} on waitlist
-              </div>
-              <div v-if="address" class="gp-mono" style="margin-top: 6px;">
-                Paying as {{ address }}
-              </div>
-            </div>
-          </details>
         </div>
+
+        <div class="detail__hero">
+          <div class="detail__cal" aria-hidden="true">
+            <span class="detail__cal-month">{{ calMonth }}</span>
+            <span class="detail__cal-day">{{ calDay }}</span>
+          </div>
+          <div class="detail__heading">
+            <div v-if="event.hallSlotId || event.soldOut || isPast" class="gp-chip-row">
+              <span v-if="event.hallSlotId" class="gp-pill gold">Nimiq Hall</span>
+              <span v-if="event.soldOut" class="gp-pill warn">Sold out</span>
+              <span v-else-if="isPast" class="gp-pill warn">Ended</span>
+            </div>
+            <h1 class="gp-page-title">
+              {{ event.title }}
+            </h1>
+          </div>
+        </div>
+
+        <dl class="detail__meta">
+          <div>
+            <dt>When</dt>
+            <dd>{{ whenLabel }}</dd>
+          </div>
+          <div>
+            <dt>Where</dt>
+            <dd>
+              <span>{{ event.venueName }}</span>
+              <a
+                v-if="event.venueLat != null && event.venueLng != null"
+                class="detail-link"
+                :href="mapsUrl(event.venueLat, event.venueLng)"
+                target="_blank"
+                rel="noopener"
+              >Map</a>
+            </dd>
+          </div>
+          <div v-if="showDescription">
+            <dt>About</dt>
+            <dd>{{ event.description }}</dd>
+          </div>
+        </dl>
+
+        <p class="detail__facts">
+          <span>{{ unitPrice }}{{ event.tiers.length > 1 ? ' from' : '' }}</span>
+          <span>{{ selectedTier?.remaining != null ? selectedTier.remaining : (event.remaining != null ? event.remaining : '∞') }} left</span>
+          <span v-if="!event.hideSoldCount">{{ event.soldCount }} going</span>
+          <span v-if="!event.hideRedeemedCount">{{ event.redeemedCount }} in</span>
+        </p>
+
+        <div v-if="!isPast && !event.soldOut && !lastTxHash" class="detail__purchase">
+          <label class="gp-label">Ticket type</label>
+          <TierPicker
+            :tiers="event.tiers"
+            :selected-id="selectedTierId"
+            @select="onSelectTier"
+          />
+
+          <SeatMap
+            v-if="isReserved && selectedTierId"
+            v-model="selectedSeatIds"
+            :event-id="event.id"
+            :tier-id="selectedTierId"
+          />
+          <p v-if="holdLabel" class="gp-banner ok" style="margin-top: 8px;">
+            {{ holdLabel }}
+          </p>
+
+          <template v-else-if="selectedTier && !isReserved">
+            <label class="gp-label">Quantity</label>
+            <div class="gp-qty">
+              <button type="button" :disabled="quantity <= selectedTier.perOrderMin" @click="bumpQty(-1)">
+                −
+              </button>
+              <strong>{{ quantity }}</strong>
+              <button
+                type="button"
+                :disabled="tierRemaining != null && quantity >= Math.min(selectedTier.perOrderMax, tierRemaining)"
+                @click="bumpQty(1)"
+              >
+                +
+              </button>
+            </div>
+          </template>
+
+          <button
+            v-if="isDemoAllowed()"
+            class="gp-btn ghost sm"
+            :disabled="loading || !canBuy"
+            type="button"
+            @click="buyDemo"
+          >
+            Get demo ticket(s)
+          </button>
+        </div>
+
+        <details class="gp-details">
+          <summary>Payment details</summary>
+          <div class="gp-banner">
+            <div class="gp-mono">
+              Organizer {{ event.organizerAddress }}
+            </div>
+            <div class="gp-mono" style="margin-top: 6px;">
+              Memo {{ paymentMemo(event.id, ticketCount) }}
+            </div>
+            <div v-if="event.waitlistCount" class="gp-mono" style="margin-top: 6px;">
+              {{ event.waitlistCount }} on waitlist
+            </div>
+            <div v-if="address" class="gp-mono" style="margin-top: 6px;">
+              Paying as {{ address }}
+            </div>
+          </div>
+        </details>
       </div>
 
       <p v-if="isPast" class="gp-error">
         This event has ended.
       </p>
-      <p v-if="status" class="gp-success">
-        {{ status }}
-      </p>
-      <p v-if="error" class="gp-error">
-        {{ error }}
-      </p>
+      <FlashBanner
+        v-if="status"
+        kind="success"
+        :message="status"
+        @clear="status = ''"
+      />
+      <FlashBanner
+        v-if="error"
+        :message="error"
+        @clear="error = ''"
+      />
       <p v-if="lastTxHash" class="gp-mono">
         tx {{ lastTxHash }}
       </p>
@@ -613,12 +836,126 @@ watch(() => props.eventId, () => {
 
 <style scoped>
 .detail-page {
-  /* Room to scroll past the compact pay bar + tab bar */
   padding-bottom: calc(var(--gp-tabbar-h) + env(safe-area-inset-bottom, 0px) + 88px);
 }
 
-.detail__body {
-  padding: 16px 18px 18px;
+.detail__nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px 0 8px;
+}
+
+.detail__nav .gp-back {
+  padding: 12px 0;
+}
+
+.detail__nav-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.detail-link {
+  border: 0;
+  background: transparent;
+  color: var(--gp-muted);
+  font-size: 0.82rem;
+  font-weight: 500;
+  min-height: 40px;
+  padding: 8px 10px;
+  text-decoration: none;
+}
+
+.detail__hero {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 16px;
+}
+
+.detail__cal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 64px;
+  padding: 8px 4px;
+  border-radius: 16px;
+  background: rgba(233, 178, 19, 0.18);
+  color: var(--gp-navy);
+}
+
+.detail__cal-month {
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: #8a6a00;
+}
+
+.detail__cal-day {
+  font-size: 1.45rem;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.detail__heading .gp-chip-row {
+  margin: 0 0 6px;
+}
+
+.detail__heading .gp-page-title {
+  margin: 0;
+  font-size: 1.45rem;
+}
+
+.detail__meta {
+  margin: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail__meta > div {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.detail__meta dt {
+  margin: 0;
+  padding-top: 1px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--gp-muted);
+}
+
+.detail__meta dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 0.92rem;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--gp-navy);
+}
+
+.detail__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0 0 4px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--gp-muted);
 }
 
 .detail__purchase {
@@ -627,20 +964,11 @@ watch(() => props.eventId, () => {
   border-top: 1px solid var(--gp-border);
 }
 
-.cover {
-  height: 168px;
-  background-size: cover;
-  background-position: center;
-  background-color: #dde1ef;
-}
-.cover.placeholder {
-  background: linear-gradient(145deg, #252a55 0%, #1f2348 55%, #151833 100%);
-}
 .cta-wallet {
   margin: 0 0 8px;
   text-align: center;
   font-size: 0.72rem;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--gp-muted);
   font-family: var(--gp-mono);
 }

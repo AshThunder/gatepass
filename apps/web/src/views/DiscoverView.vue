@@ -2,21 +2,42 @@
 import { computed, onMounted, ref } from 'vue'
 import { api } from '@/api/client'
 import EventCard from '@/components/EventCard.vue'
-import type { EventRecord } from '@gatepass/shared'
+import HallMapPreview from '@/components/HallMapPreview.vue'
+import FlashBanner from '@/components/FlashBanner.vue'
+import type { EventRecord, HallInfo } from '@gatepass/shared'
 
 const emit = defineEmits<{
   openEvent: [eventId: string]
-  goHost: []
+  goHost: [hall?: boolean]
 }>()
 
 type Filter = 'upcoming' | 'tonight' | 'weekend' | 'all'
 
 const events = ref<EventRecord[]>([])
+const hall = ref<HallInfo | null>(null)
+const showHallPreview = ref(false)
 const loading = ref(true)
 const error = ref('')
 const query = ref('')
 const filter = ref<Filter>('upcoming')
 const showEnded = ref(false)
+
+const openHallSlots = computed(() =>
+  (hall.value?.slots || []).filter(s => s.status === 'open'),
+)
+
+const nextHallSlotLabel = computed(() => {
+  const s = openHallSlots.value[0]
+  if (!s)
+    return ''
+  return new Date(s.startsAt).toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+})
 
 function startOfDay(d = new Date()) {
   const x = new Date(d)
@@ -80,19 +101,20 @@ const filtered = computed(() => {
   return list.sort((a, b) => +new Date(a.startsAt) - +new Date(b.startsAt))
 })
 
-/** Soonest event gets the featured pass when there’s more than one. */
+/** Prefer Nimiq Hall events, else soonest upcoming. */
 const featured = computed(() => {
   if (query.value.trim() || filtered.value.length < 2)
     return null
   if (filter.value !== 'upcoming' && filter.value !== 'tonight')
     return null
-  return filtered.value[0] || null
+  const hall = filtered.value.find(e => e.hallSlotId)
+  return hall || filtered.value[0] || null
 })
 
 const list = computed(() => {
   if (!featured.value)
     return filtered.value
-  return filtered.value.slice(1)
+  return filtered.value.filter(e => e.id !== featured.value!.id)
 })
 
 const resultLabel = computed(() => {
@@ -108,7 +130,10 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const res = await api.listEvents()
+    const [res] = await Promise.all([
+      api.listEvents(),
+      api.getHall().then((h) => { hall.value = h }).catch(() => { hall.value = null }),
+    ])
     events.value = res.events
   }
   catch (err) {
@@ -175,21 +200,57 @@ onMounted(() => {
       </label>
     </div>
 
+    <details
+      v-if="!loading && hall && openHallSlots.length"
+      class="gp-details hall-promo"
+    >
+      <summary>
+        <span class="hall-promo__line">
+          <span class="gp-pill gold">Nimiq Hall</span>
+          <span class="hall-promo__next">{{ nextHallSlotLabel }}</span>
+        </span>
+      </summary>
+      <div class="hall-promo__body">
+        <p class="gp-sub">
+          {{ hall.capacity }} labeled seats. Rent from Host ({{ hall.rentNim }} NIM), then sell up to {{ hall.capacity }} tickets.
+        </p>
+        <div class="gp-row" style="margin-top: 10px;">
+          <button class="gp-btn secondary" type="button" @click="emit('goHost', true)">
+            Book Nimiq Hall
+          </button>
+          <button
+            class="gp-btn ghost sm"
+            type="button"
+            @click="showHallPreview = !showHallPreview"
+          >
+            {{ showHallPreview ? 'Hide preview' : 'Hall preview' }}
+          </button>
+        </div>
+        <HallMapPreview
+          v-if="showHallPreview && hall.previewSeats?.length"
+          :seats="hall.previewSeats"
+        />
+      </div>
+    </details>
+
+    <FlashBanner
+      v-if="error"
+      :message="error"
+      @clear="error = ''"
+    />
+
     <div v-if="loading" class="discover__loading">
       <div class="skel featured" />
       <div class="skel" />
       <div class="skel" />
     </div>
-    <p v-else-if="error" class="gp-error">
-      {{ error }}
-    </p>
     <div v-else-if="!filtered.length" class="gp-card">
       <div class="gp-empty">
         <svg class="gp-hex" viewBox="0 0 32 32" width="40" height="40" aria-hidden="true">
           <path fill="#E9B213" d="M16 2.5 28 9.5v13L16 29.5 4 22.5v-13L16 2.5Z" />
         </svg>
         <h2>No events here</h2>
-        <p>Try another filter, or create one from Host.</p>
+        <p>Try another filter, or book Nimiq Hall from Host.</p>
         <div class="gp-row" style="max-width: 280px; margin: 0 auto;">
           <button class="gp-btn ghost sm" type="button" @click="load">
             Refresh
@@ -204,7 +265,7 @@ onMounted(() => {
     <template v-else>
       <div v-if="featured" class="discover__feature">
         <div class="discover__label">
-          <span>Up next</span>
+          <span>{{ featured.hallSlotId ? 'Nimiq Hall' : 'Up next' }}</span>
         </div>
         <EventCard
           class="discover__item"
@@ -238,33 +299,56 @@ onMounted(() => {
 .discover__intro {
   margin-bottom: 4px;
 }
+.hall-promo {
+  margin: 0 0 12px;
+}
+.hall-promo__line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hall-promo__next {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--gp-muted);
+}
+.hall-promo__body {
+  padding: 0 2px 4px;
+}
+.hall-promo__body .gp-btn {
+  margin-top: 0;
+}
 .discover__eyebrow {
-  margin: 0 0 6px;
-  font-size: 0.7rem;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: #b8860b;
+  margin: 0 0 4px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--gp-muted);
 }
 .discover__title {
   margin: 0 0 6px;
-  font-size: 1.45rem;
-  font-weight: 800;
-  letter-spacing: -0.035em;
-  line-height: 1.1;
+  font-size: 1.75rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.2;
   color: var(--gp-navy);
 }
 .discover__lead {
   margin: 0;
-  max-width: 36ch;
+  max-width: 40ch;
   color: var(--gp-muted);
-  font-size: 0.84rem;
+  font-size: 0.875rem;
   line-height: 1.4;
-  font-weight: 600;
+  font-weight: 400;
 }
 
 .discover__tools {
-  margin: 18px 0 20px;
+  margin: 16px 0 16px;
 }
 
 .discover__search {
@@ -272,21 +356,21 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
-  padding: 0 14px;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.86);
-  border: 1px solid var(--gp-border);
+  padding: 0 16px;
+  min-height: 56px;
+  border-radius: 28px;
+  background: var(--gp-surface-high);
+  border: 0;
   color: var(--gp-muted);
-  box-shadow: 0 6px 20px rgba(31, 35, 72, 0.05);
 }
 .discover__search input {
   flex: 1;
   min-width: 0;
   border: 0;
   background: transparent;
-  padding: 13px 0;
+  padding: 16px 0;
   color: var(--gp-navy);
-  font-weight: 600;
+  font-weight: 400;
 }
 .discover__search input::placeholder {
   color: var(--gp-muted);
@@ -301,10 +385,9 @@ onMounted(() => {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 10px;
-  font-size: 0.78rem;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
   color: var(--gp-muted);
 }
 .discover__count {

@@ -9,16 +9,28 @@ import {
   verifyTotp,
 } from '@/crypto/ticket'
 import type { EventRecord, GateBundle } from '@gatepass/shared'
+import FlashBanner from '@/components/FlashBanner.vue'
 
 const STORAGE_KEY = 'gatepass:gateBundle'
 const QUEUE_KEY = 'gatepass:redeemQueue'
+const TABLET_KEY = 'gatepass:gateTablet'
 const AUTO_MS = 45_000
 
 type Mode = 'unlock' | 'scan'
-type UnlockTab = 'host' | 'staff'
+
+const props = defineProps<{
+  pendingUnlock?: {
+    eventId: string
+    token: string
+    secret?: string
+  } | null
+}>()
+
+const emit = defineEmits<{
+  unlockConsumed: []
+}>()
 
 const mode = ref<Mode>('unlock')
-const unlockTab = ref<UnlockTab>('host')
 const unlocked = ref(false)
 const bundle = ref<GateBundle | null>(null)
 const unlockInput = ref('')
@@ -33,9 +45,11 @@ const lastSyncedLabel = ref('')
 const events = ref<EventRecord[]>([])
 const staffEventId = ref('')
 const staffPass = ref('')
+const tabletMode = ref(localStorage.getItem(TABLET_KEY) === '1')
 let scanner: Html5Qrcode | null = null
 let handling = false
 let autoTimer: ReturnType<typeof setInterval> | null = null
+let wakeLock: WakeLockSentinel | null = null
 
 const cachedCount = computed(() => bundle.value?.tickets.length || 0)
 const validCached = computed(() =>
@@ -44,6 +58,35 @@ const validCached = computed(() =>
 const staffEvents = computed(() =>
   events.value.filter(e => e.hasStaffPasscode && Date.now() <= new Date(e.endsAt).getTime() + 6 * 3600_000),
 )
+
+function eventWhen(ev: EventRecord) {
+  return new Date(ev.startsAt).toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+function toggleTablet() {
+  tabletMode.value = !tabletMode.value
+  localStorage.setItem(TABLET_KEY, tabletMode.value ? '1' : '0')
+  void manageWakeLock()
+}
+
+async function manageWakeLock() {
+  try {
+    if (tabletMode.value && unlocked.value && 'wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen')
+    }
+    else if (wakeLock) {
+      await wakeLock.release()
+      wakeLock = null
+    }
+  }
+  catch { /* unsupported */ }
+}
 
 function refreshCameraCapability() {
   const hasMedia = typeof navigator !== 'undefined'
@@ -115,6 +158,7 @@ async function applyBundle(data: GateBundle, unlockToken?: string, masterSecret?
       gateUnlockToken: unlockToken,
     }))
   }
+  void manageWakeLock()
   void startScan()
 }
 
@@ -126,8 +170,11 @@ async function unlockFromPayload(raw: string) {
     return
   }
   const parsed = decodeGateUnlock(raw)
-  if (!parsed)
-    throw new Error('Need host GPGATE… or staff GPSTAFF… QR — not a ticket QR')
+  if (!parsed) {
+    if (raw.trim().startsWith('GP1:'))
+      throw new Error('That’s a guest ticket. Unlock from My events, or type the door PIN.')
+    throw new Error('Unlock from My events, or type the door PIN.')
+  }
   const data = await api.gateBundle(parsed.eventId, parsed.unlockToken)
   await applyBundle(data, parsed.unlockToken, parsed.masterSecret)
 }
@@ -137,7 +184,7 @@ async function unlockManual() {
   message.value = ''
   const raw = unlockInput.value.trim()
   if (!raw) {
-    error.value = 'Paste GPGATE… or eventId|token'
+    error.value = 'Paste the unlock code, or type the door PIN.'
     return
   }
   try {
@@ -151,7 +198,7 @@ async function unlockManual() {
       return
     }
     if (raw.startsWith('GP1:')) {
-      error.value = 'That’s a ticket. Stay in Unlock mode and use the host / staff QR first.'
+      error.value = 'That’s a guest ticket. Unlock from My events, or type the door PIN.'
       return
     }
     const [eventId, token] = raw.split('|').map(s => s.trim())
@@ -160,7 +207,7 @@ async function unlockManual() {
       await applyBundle(data, token)
       return
     }
-    error.value = 'Unrecognized unlock text'
+    error.value = 'Paste the unlock code, or type the door PIN.'
   }
   catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -175,7 +222,7 @@ async function unlockWithStaffPass() {
     return
   }
   if (!staffPass.value.trim()) {
-    error.value = 'Enter staff passcode'
+    error.value = 'Enter the door PIN'
     return
   }
   try {
@@ -185,6 +232,24 @@ async function unlockWithStaffPass() {
   }
   catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+async function consumePendingUnlock() {
+  const pending = props.pendingUnlock
+  if (!pending?.eventId || !pending.token)
+    return false
+  error.value = ''
+  try {
+    const data = await api.gateBundle(pending.eventId, pending.token)
+    await applyBundle(data, pending.token, pending.secret)
+    emit('unlockConsumed')
+    return true
+  }
+  catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+    emit('unlockConsumed')
+    return false
   }
 }
 
@@ -252,12 +317,15 @@ async function handleScan(raw: string) {
         await unlockFromPayload(cleaned)
         return
       }
-      if (mode.value === 'unlock')
-        throw new Error('In Unlock mode — scan host GPGATE or staff GPSTAFF QR')
+      if (mode.value === 'unlock') {
+        if (cleaned.startsWith('GP1:') || cleaned.replace(/\s+/g, '').startsWith('GP1:'))
+          throw new Error('That’s a guest ticket. Unlock from My events, or type the door PIN.')
+        throw new Error('Unlock from My events, or type the door PIN.')
+      }
     }
 
     if (!bundle.value || !unlocked.value)
-      throw new Error('Gate locked — unlock first')
+      throw new Error('Unlock first, then scan guest tickets')
 
     if (mode.value !== 'scan')
       throw new Error('Switch to Scan tickets mode')
@@ -298,6 +366,9 @@ async function handleScan(raw: string) {
     setTimeout(() => {
       handling = false
     }, 1200)
+    setTimeout(() => {
+      lastResult.value = null
+    }, 2800)
   }
 }
 
@@ -379,12 +450,21 @@ watch(mode, (m) => {
 })
 
 onMounted(async () => {
-  restoreBundle()
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('tablet') === '1') {
+    tabletMode.value = true
+    localStorage.setItem(TABLET_KEY, '1')
+  }
   refreshCameraCapability()
-  if (unlocked.value && mode.value === 'scan')
-    void startScan()
+  const fromHost = await consumePendingUnlock()
+  if (!fromHost) {
+    restoreBundle()
+    if (unlocked.value && mode.value === 'scan')
+      void startScan()
+  }
   pendingCount.value = loadQueue().length
   void syncQueue()
+  void manageWakeLock()
   autoTimer = setInterval(() => {
     if (!unlocked.value || !bundle.value)
       return
@@ -394,9 +474,8 @@ onMounted(async () => {
   try {
     const res = await api.listEvents()
     events.value = res.events
-    const withPin = staffEvents.value[0]
-    if (withPin)
-      staffEventId.value = withPin.id
+    if (staffEvents.value.length === 1)
+      staffEventId.value = staffEvents.value[0]!.id
   }
   catch { /* ignore */ }
 })
@@ -409,180 +488,222 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section>
-    <h1 class="gp-page-title">
-      Gate
-    </h1>
-    <p class="gp-page-sub">
-      {{ unlocked ? 'Scanning tickets for this door.' : 'Unlock once, then keep scanning.' }}
-    </p>
-
-    <div class="gp-segment">
-      <button type="button" :class="{ active: mode === 'unlock' }" @click="mode = 'unlock'">
-        Unlock
-      </button>
-      <button
-        type="button"
-        :class="{ active: mode === 'scan' }"
-        :disabled="!unlocked"
-        @click="unlocked && (mode = 'scan')"
-      >
-        Scan
+  <section :class="{ tablet: tabletMode }">
+    <div class="gate-top">
+      <div>
+        <h1 class="gp-page-title">
+          Gate
+        </h1>
+        <p class="gp-page-sub">
+          {{ unlocked ? `Step 2 of 2 · ${bundle?.eventTitle}` : 'Step 1 of 2 · Unlock' }}
+        </p>
+      </div>
+      <button class="gp-btn ghost sm" type="button" style="width: auto; flex-shrink: 0;" @click="toggleTablet">
+        {{ tabletMode ? 'Phone' : 'Tablet' }}
       </button>
     </div>
 
-    <div v-if="mode === 'unlock'" class="gp-card">
-      <div v-if="unlocked" class="gp-banner ok">
-        Unlocked for <strong>{{ bundle?.eventTitle }}</strong>.
-        <div class="gp-row" style="margin-top: 10px;">
-          <button class="gp-btn secondary sm" type="button" @click="mode = 'scan'">
-            Back to scan
+    <template v-if="!unlocked">
+      <div class="gp-card">
+        <h2 class="gp-h2">
+          Unlock
+        </h2>
+        <p class="gp-sub">
+          Enter the door PIN, or tap Check in guests on My events.
+        </p>
+        <div id="gate-reader" class="gate-reader" />
+        <p v-if="cameraHint" class="gp-banner" style="margin-top: 10px;">
+          {{ cameraHint }}
+        </p>
+        <div class="gp-row" style="margin-top: 12px;">
+          <button v-if="!scanning" class="gp-btn" type="button" @click="startScan">
+            Start camera
           </button>
-          <button class="gp-btn ghost sm" type="button" @click="lockGate">
-            Lock
-          </button>
-        </div>
-      </div>
-
-      <template v-else>
-        <div class="gp-segment" style="margin-bottom: 14px;">
-          <button type="button" :class="{ active: unlockTab === 'host' }" @click="unlockTab = 'host'">
-            Host QR
-          </button>
-          <button type="button" :class="{ active: unlockTab === 'staff' }" @click="unlockTab = 'staff'">
-            Staff PIN
+          <button v-else class="gp-btn danger" type="button" @click="stopScan">
+            Pause
           </button>
         </div>
 
-        <template v-if="unlockTab === 'host'">
-          <p class="gp-sub">
-            Scan host <strong>GPGATE</strong> or staff <strong>GPSTAFF</strong> QR from the organizer — never a guest ticket.
-          </p>
-          <label class="gp-label">Unlock payload</label>
-          <textarea v-model="unlockInput" class="gp-textarea" placeholder="GPGATE:… or GPSTAFF:…" />
-          <button class="gp-btn" type="button" @click="unlockManual">
-            Unlock with pasted code
-          </button>
-        </template>
-
-        <template v-else>
-          <p class="gp-sub">
-            Or type the staff PIN manually. Prefer scanning the staff QR from Host → Share night.
-          </p>
+        <template v-if="staffEvents.length">
           <label class="gp-label">Event</label>
-          <select v-model="staffEventId" class="gp-input gp-select">
-            <option disabled value="">
-              Select event
-            </option>
-            <option v-for="ev in staffEvents" :key="ev.id" :value="ev.id">
-              {{ ev.title }}
-            </option>
-          </select>
-          <p v-if="!staffEvents.length" class="gp-banner warn">
-            No events with a staff PIN. Ask the host to set one, or use Host QR.
-          </p>
-          <label class="gp-label">Staff passcode</label>
+          <div class="gate-ev-list">
+            <button
+              v-for="ev in staffEvents"
+              :key="ev.id"
+              type="button"
+              class="gate-ev"
+              :class="{ on: staffEventId === ev.id }"
+              @click="staffEventId = ev.id"
+            >
+              <strong>{{ ev.title }}</strong>
+              <span>{{ eventWhen(ev) }} · {{ ev.venueName }}</span>
+            </button>
+          </div>
+          <label class="gp-label">Door PIN</label>
           <input
             v-model="staffPass"
             class="gp-input"
             type="password"
             inputmode="numeric"
             autocomplete="off"
-            placeholder="PIN"
+            placeholder="Door PIN"
           >
-          <button class="gp-btn" type="button" @click="unlockWithStaffPass">
-            Unlock with staff PIN
+          <button
+            class="gp-btn secondary sm"
+            type="button"
+            :disabled="!staffEventId"
+            @click="unlockWithStaffPass"
+          >
+            Unlock
           </button>
         </template>
-      </template>
-    </div>
 
-    <div v-if="mode === 'scan'" class="gp-card">
-      <div class="gp-chip-row">
-        <span class="gp-pill ok">{{ scanning ? 'Live' : 'Ready' }}</span>
-        <span v-if="lastSyncedLabel" class="gp-pill muted">{{ lastSyncedLabel }}</span>
+        <details class="gp-details" style="margin-top: 12px;">
+          <summary>Can't scan?</summary>
+          <label class="gp-label">Unlock code</label>
+          <textarea v-model="unlockInput" class="gp-textarea" placeholder="Unlock code" />
+          <button class="gp-btn secondary sm" type="button" @click="unlockManual">
+            Unlock
+          </button>
+        </details>
+
+        <FlashBanner
+          v-if="error"
+          :message="error"
+          @clear="error = ''"
+        />
       </div>
-      <h2 class="gp-h2">
-        {{ bundle?.eventTitle }}
-      </h2>
-      <div class="gp-stat-grid">
-        <div class="gp-stat">
-          <strong>{{ cachedCount }}</strong>
-          <span>cached</span>
+    </template>
+
+    <template v-else>
+      <div class="scan-shell">
+        <p class="gp-sub" style="margin-bottom: 10px;">
+          Now scan each guest’s ticket.
+        </p>
+        <div class="gp-chip-row">
+          <span class="gp-pill ok">{{ scanning ? 'Live' : 'Ready' }}</span>
+          <span class="gp-pill">{{ validCached }} left</span>
+          <span v-if="pendingCount" class="gp-pill warn">{{ pendingCount }} queued</span>
         </div>
-        <div class="gp-stat">
-          <strong>{{ validCached }}</strong>
-          <span>valid</span>
+        <div id="gate-reader" class="gate-reader tall" />
+        <div v-if="lastResult" class="gate-result" :class="lastResult">
+          {{ lastResult === 'ok' ? 'ACCEPT' : 'DENY' }}
         </div>
-        <div class="gp-stat">
-          <strong>{{ pendingCount }}</strong>
-          <span>queued</span>
+        <FlashBanner
+          v-if="message"
+          kind="success"
+          :message="message"
+          @clear="message = ''"
+        />
+        <FlashBanner
+          v-if="error"
+          :message="error"
+          @clear="error = ''"
+        />
+        <div class="gp-row" style="margin-top: 12px;">
+          <button v-if="!scanning" class="gp-btn" type="button" @click="startScan">
+            Resume camera
+          </button>
+          <button v-else class="gp-btn danger" type="button" @click="stopScan">
+            Pause
+          </button>
+          <button class="gp-btn ghost sm" type="button" @click="refreshBundle">
+            Refresh
+          </button>
+          <button class="gp-btn ghost sm" type="button" @click="lockGate">
+            Lock
+          </button>
         </div>
+        <details class="gp-details" style="margin-top: 12px;">
+          <summary>Can't scan ticket?</summary>
+          <textarea v-model="ticketInput" class="gp-textarea" placeholder="Paste ticket code" />
+          <button class="gp-btn secondary sm" type="button" @click="submitTicketPaste">
+            Check in
+          </button>
+        </details>
       </div>
-      <div class="gp-row">
-        <button class="gp-btn secondary sm" type="button" @click="refreshBundle">
-          Refresh list
-        </button>
-        <button class="gp-btn ghost sm" type="button" @click="syncQueue">
-          Sync queue
-        </button>
-      </div>
-    </div>
-
-    <div class="gp-card">
-      <h2 class="gp-h2">
-        {{ mode === 'unlock' ? 'Point at unlock QR' : 'Point at ticket QR' }}
-      </h2>
-      <div id="gate-reader" class="gate-reader" />
-      <p v-if="cameraHint" class="gp-banner" style="margin-top: 10px;">
-        {{ cameraHint }}
-      </p>
-      <div class="gp-row" style="margin-top: 12px;">
-        <button v-if="!scanning" class="gp-btn" type="button" @click="startScan">
-          {{ mode === 'unlock' ? 'Start camera' : 'Resume camera' }}
-        </button>
-        <button v-else class="gp-btn danger" type="button" @click="stopScan">
-          Pause camera
-        </button>
-      </div>
-
-      <details v-if="mode === 'scan'" class="gp-details" style="margin-top: 12px;">
-        <summary>Paste ticket instead</summary>
-        <textarea v-model="ticketInput" class="gp-textarea" placeholder="GP1:…" />
-        <button class="gp-btn secondary sm" type="button" @click="submitTicketPaste">
-          Check in
-        </button>
-      </details>
-
-      <div v-if="lastResult" class="gate-result" :class="lastResult">
-        {{ lastResult === 'ok' ? 'ACCEPT' : 'DENY' }}
-      </div>
-      <p v-if="message" class="gp-success">
-        {{ message }}
-      </p>
-      <p v-if="error" class="gp-error">
-        {{ error }}
-      </p>
-    </div>
+    </template>
   </section>
 </template>
 
 <style scoped>
+.gate-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.gate-ev-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.gate-ev {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--gp-border);
+  border-radius: 16px;
+  padding: 12px 14px;
+  background: #fff;
+  color: var(--gp-navy);
+}
+.gate-ev strong {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.gate-ev span {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--gp-muted);
+}
+.gate-ev.on {
+  border-color: var(--gp-gold);
+  background: rgba(233, 178, 19, 0.14);
+}
+.scan-shell {
+  margin: 0 -16px;
+  padding: 0;
+}
+.scan-shell .gp-chip-row,
+.scan-shell .gate-result,
+.scan-shell .gp-row,
+.scan-shell .gp-details,
+.scan-shell .gp-sub {
+  margin-left: 16px;
+  margin-right: 16px;
+}
 .gate-reader {
   width: 100%;
   overflow: hidden;
-  border-radius: 14px;
-  min-height: 8px;
-  background: rgba(31, 35, 72, 0.04);
+  border-radius: 16px;
+  min-height: 0;
+  background: transparent;
+}
+.gate-reader.tall {
+  min-height: 280px;
+  border-radius: 0;
+  width: 100%;
+  margin: 0;
+  background: #111318;
 }
 .gate-result {
   margin-top: 14px;
   text-align: center;
-  font-weight: 900;
-  font-size: 1.4rem;
+  font-weight: 500;
+  font-size: 2rem;
   letter-spacing: 0.08em;
-  padding: 16px;
-  border-radius: var(--gp-radius-sm);
+  padding: 22px;
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
   animation: gp-fade-in 220ms var(--gp-ease);
 }
 .gate-result.ok {
@@ -592,5 +713,19 @@ onUnmounted(() => {
 .gate-result.fail {
   background: rgba(217, 68, 79, 0.14);
   color: var(--gp-danger);
+}
+.tablet .gp-page-title {
+  font-size: 1.75rem;
+}
+.tablet .gate-result {
+  font-size: 2.2rem;
+  padding: 28px;
+}
+.tablet .gp-btn {
+  min-height: 52px;
+  font-size: 1rem;
+}
+.tablet .gate-reader.tall {
+  min-height: 320px;
 }
 </style>

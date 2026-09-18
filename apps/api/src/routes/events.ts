@@ -18,8 +18,10 @@ import type {
 } from '@gatepass/shared'
 import {
   HOLD_TTL_MS,
+  addressesEqual,
   deriveTicketSeed,
   generateMasterSecret,
+  isNqAddress,
   nimToLuna,
   paymentMemo,
   tierOnSale,
@@ -40,7 +42,7 @@ import {
   assertPaymentMatches,
   waitForTransaction,
 } from '../nimiq-rpc.js'
-import { generateSeatLayout } from '../seat-templates.js'
+import { generateSeatLayout, NIMIQ_HALL_CAPACITY } from '../seat-templates.js'
 
 function hashStaffPass(passcode: string, salt: string) {
   return createHash('sha256').update(`${salt}:${passcode}`).digest('hex')
@@ -243,6 +245,7 @@ function rowToEvent(row: EventRow): EventRecord {
     hasStaffPasscode: !!(row.staff_pass_hash && row.staff_pass_salt),
     hideSoldCount: !!row.hide_sold_count,
     hideRedeemedCount: !!row.hide_redeemed_count,
+    hallSlotId: row.hall_slot_id || null,
     tiers,
   }
 }
@@ -344,7 +347,9 @@ function normalizeTierInput(body: CreateEventRequest): CreateTierInput[] {
 }
 
 function insertSeatsForTier(eventId: string, tierId: string, template: SeatTemplateId) {
-  const layout = generateSeatLayout(template)
+  let layout = generateSeatLayout(template)
+  if (template === 'nimiq-hall')
+    layout = layout.slice(0, NIMIQ_HALL_CAPACITY)
   const insert = db.prepare(`
     INSERT INTO seats (id, event_id, tier_id, label, row_key, x, y, status, held_until, held_by, hold_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'available', NULL, NULL, NULL)
@@ -372,6 +377,17 @@ export function createEvent(body: CreateEventRequest) {
       throw new HttpError(400, 'tier capacity must be a positive number or null')
     if (t.kind === 'reserved' && !t.mapTemplate)
       throw new HttpError(400, 'reserved tiers require mapTemplate')
+    if (t.mapTemplate === 'nimiq-hall' && t.capacity != null && t.capacity > NIMIQ_HALL_CAPACITY)
+      throw new HttpError(400, `Nimiq Hall capacity cannot exceed ${NIMIQ_HALL_CAPACITY}`)
+  }
+
+  if (body.hallSlotId) {
+    const hallTiers = tierInputs.filter(t => t.kind === 'reserved' && t.mapTemplate === 'nimiq-hall')
+    if (hallTiers.length !== 1 || tierInputs.length !== 1)
+      throw new HttpError(400, 'Nimiq Hall events use a single reserved seat map')
+    const seats = generateSeatLayout('nimiq-hall').length
+    if (seats > NIMIQ_HALL_CAPACITY)
+      throw new HttpError(500, `Nimiq Hall map exceeds ${NIMIQ_HALL_CAPACITY} seats`)
   }
 
   const id = nanoid(12)
@@ -407,8 +423,8 @@ export function createEvent(body: CreateEventRequest) {
       INSERT INTO events (
         id, title, description, cover_url, starts_at, ends_at, price_luna, capacity,
         venue_name, venue_lat, venue_lng, organizer_address, master_secret, unlock_token,
-        staff_pass_salt, staff_pass_hash, hide_sold_count, hide_redeemed_count, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        staff_pass_salt, staff_pass_hash, hide_sold_count, hide_redeemed_count, hall_slot_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       body.title.trim(),
@@ -428,6 +444,7 @@ export function createEvent(body: CreateEventRequest) {
       staff.hash,
       body.hideSoldCount ? 1 : 0,
       body.hideRedeemedCount ? 1 : 0,
+      body.hallSlotId || null,
       now,
     )
 
@@ -440,6 +457,8 @@ export function createEvent(body: CreateEventRequest) {
       let seatCount = 0
       if (t.kind === 'reserved' && t.mapTemplate) {
         seatCount = generateSeatLayout(t.mapTemplate).length
+        if (t.mapTemplate === 'nimiq-hall')
+          seatCount = Math.min(seatCount, NIMIQ_HALL_CAPACITY)
         cap = seatCount
         reservedCapSum += seatCount
       }
@@ -534,9 +553,20 @@ function validateCart(expanded: Array<{ tier: TierRow, quantity: number, seatIds
   return { total, priceLuna }
 }
 
+function holdOwnerKey(raw: string) {
+  return raw.replace(/\s+/g, '').toUpperCase()
+}
+
+function seatHeldBy(seat: SeatRow, buyerKey: string) {
+  if (!seat.held_by)
+    return false
+  return holdOwnerKey(seat.held_by) === holdOwnerKey(buyerKey)
+}
+
 function assertInventoryAvailable(
   expanded: Array<{ tier: TierRow, quantity: number, seatIds: string[] }>,
   holdId?: string,
+  buyerKey?: string,
 ) {
   for (const line of expanded) {
     if (line.tier.kind === 'reserved') {
@@ -547,7 +577,8 @@ function assertInventoryAvailable(
         if (seat.status === 'sold')
           throw new HttpError(409, `Seat ${seat.label} is taken`)
         if (seat.status === 'held') {
-          const ours = holdId && seat.hold_id === holdId
+          const ours = (holdId && seat.hold_id === holdId)
+            || (buyerKey && seatHeldBy(seat, buyerKey))
           const expired = seat.held_until && seat.held_until <= new Date().toISOString()
           if (!ours && !expired)
             throw new HttpError(409, `Seat ${seat.label} is held`)
@@ -574,10 +605,12 @@ export function createHold(eventId: string, body: HoldRequest): HoldResponse {
   const expiresAt = new Date(now + HOLD_TTL_MS).toISOString()
   const createdAt = new Date(now).toISOString()
   const buyerKey = body.buyerKey.trim()
+  const owner = holdOwnerKey(buyerKey)
+  const priorHoldId = body.holdId?.trim() || ''
 
   const run = db.transaction(() => {
     releaseExpiredHolds()
-    assertInventoryAvailable(expanded)
+    assertInventoryAvailable(expanded, priorHoldId || undefined, buyerKey)
 
     for (const line of expanded) {
       if (line.tier.kind !== 'reserved')
@@ -585,17 +618,33 @@ export function createHold(eventId: string, body: HoldRequest): HoldResponse {
       for (const seatId of line.seatIds) {
         const res = db.prepare(`
           UPDATE seats SET status = 'held', held_until = ?, held_by = ?, hold_id = ?
-          WHERE id = ? AND tier_id = ? AND status = 'available'
-        `).run(expiresAt, buyerKey, holdId, seatId, line.tier.id)
+          WHERE id = ? AND tier_id = ?
+            AND (
+              status = 'available'
+              OR (status = 'held' AND REPLACE(UPPER(held_by), ' ', '') = ?)
+              OR (status = 'held' AND ? != '' AND hold_id = ?)
+            )
+        `).run(expiresAt, owner, holdId, seatId, line.tier.id, owner, priorHoldId, priorHoldId)
         if (res.changes !== 1)
           throw new HttpError(409, 'Seat no longer available')
       }
     }
 
+    const stale = db.prepare(
+      `SELECT id FROM holds WHERE event_id = ? AND REPLACE(UPPER(buyer_key), ' ', '') = ? AND id != ?`,
+    ).all(eventId, owner, holdId) as Array<{ id: string }>
+    for (const old of stale) {
+      db.prepare(`
+        UPDATE seats SET status = 'available', held_until = NULL, held_by = NULL, hold_id = NULL
+        WHERE hold_id = ? AND status = 'held'
+      `).run(old.id)
+      db.prepare(`DELETE FROM holds WHERE id = ?`).run(old.id)
+    }
+
     db.prepare(`
       INSERT INTO holds (id, event_id, buyer_key, payload, price_luna, expires_at, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(holdId, eventId, buyerKey, JSON.stringify(body.items), priceLuna, expiresAt, createdAt)
+    `).run(holdId, eventId, owner, JSON.stringify(body.items), priceLuna, expiresAt, createdAt)
   })
   run()
 
@@ -740,14 +789,16 @@ export async function purchaseTicket(
 
   const commit = db.transaction(() => {
     releaseExpiredHolds()
-    assertInventoryAvailable(expanded, holdId)
+    assertInventoryAvailable(expanded, holdId, resolvedBuyer)
 
     for (const line of expanded) {
       if (line.tier.kind === 'reserved') {
         for (const seatId of line.seatIds) {
-          // Allow converting our own hold, or taking available
           const seat = db.prepare(`SELECT * FROM seats WHERE id = ?`).get(seatId) as SeatRow
-          if (seat.status === 'held' && holdId && seat.hold_id === holdId) {
+          const ours = seat.status === 'held' && (
+            (holdId && seat.hold_id === holdId) || seatHeldBy(seat, resolvedBuyer)
+          )
+          if (ours) {
             db.prepare(`UPDATE seats SET status = 'sold', held_until = NULL, held_by = NULL, hold_id = NULL WHERE id = ?`).run(seatId)
           }
           else {
@@ -848,16 +899,22 @@ export async function transferTicket(ticketId: string, toAddress: string, fromAd
     throw new HttpError(404, 'Ticket not found')
   if (row.status !== 'valid')
     throw new HttpError(409, `Cannot transfer ticket in status ${row.status}`)
-  if (!toAddress?.trim())
-    throw new HttpError(400, 'toAddress required')
-  if (fromAddress && fromAddress.replace(/\s/g, '').toUpperCase() !== row.buyer_address.replace(/\s/g, '').toUpperCase())
+  if (!fromAddress?.trim())
+    throw new HttpError(400, 'fromAddress required')
+  if (!addressesEqual(fromAddress, row.buyer_address))
     throw new HttpError(403, 'fromAddress does not own this ticket')
+  if (!toAddress?.trim() || !isNqAddress(toAddress))
+    throw new HttpError(400, 'Valid toAddress required')
+  if (addressesEqual(toAddress, row.buyer_address))
+    throw new HttpError(400, 'Cannot transfer a ticket to yourself')
 
   const event = getEventOrThrow(row.event_id)
   const now = new Date().toISOString()
   const newId = nanoid(16)
+  const transferId = nanoid(16)
   const seed = await deriveTicketSeed(event.master_secret, newId)
   const newHash = `transfer:${row.id}:${newId}`
+  const recipient = toAddress.trim()
 
   const run = db.transaction(() => {
     db.prepare(`UPDATE tickets SET status = 'cancelled', cancelled_at = ?, seat_id = NULL WHERE id = ?`).run(now, ticketId)
@@ -865,13 +922,30 @@ export async function transferTicket(ticketId: string, toAddress: string, fromAd
       INSERT INTO tickets (
         id, event_id, buyer_address, tx_hash, ticket_seed, status, created_at, redeemed_at, cancelled_at, tier_id, seat_id
       ) VALUES (?, ?, ?, ?, ?, 'valid', ?, NULL, NULL, ?, ?)
-    `).run(newId, row.event_id, toAddress.trim(), newHash, seed, now, row.tier_id, row.seat_id)
+    `).run(newId, row.event_id, recipient, newHash, seed, now, row.tier_id, row.seat_id)
+    db.prepare(`
+      INSERT INTO ticket_transfers (
+        id, from_address, to_address, from_ticket_id, to_ticket_id, event_id, tier_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(transferId, row.buyer_address, recipient, ticketId, newId, row.event_id, row.tier_id, now)
   })
   run()
 
+  const issued = getTicket(newId)
   return {
     cancelledTicketId: ticketId,
-    ticket: getTicket(newId),
+    transfer: {
+      toTicketId: issued.id,
+      toAddress: issued.buyerAddress,
+      fromAddress: row.buyer_address,
+      fromTicketId: ticketId,
+      eventId: event.id,
+      eventTitle: event.title,
+      tierId: issued.tierId,
+      tierName: issued.tierName,
+      seatLabel: issued.seatLabel,
+      createdAt: now,
+    },
   }
 }
 
@@ -904,6 +978,19 @@ export function getGateBundle(eventId: string, unlockToken: string) {
 export function staffUnlock(eventId: string, passcode: string) {
   const event = getEventOrThrow(eventId)
   verifyStaffPass(event, passcode)
+  return {
+    eventId: event.id,
+    gateUnlockToken: event.unlock_token,
+    eventMasterSecret: event.master_secret,
+    bundle: buildGateBundle(event),
+  }
+}
+
+/** Organizer wallet session — same payload as staff PIN unlock. */
+export function hostUnlock(eventId: string, organizerAddress: string) {
+  const event = getEventOrThrow(eventId)
+  if (!addressesEqual(event.organizer_address, organizerAddress))
+    throw new HttpError(403, 'Not the host of this event')
   return {
     eventId: event.id,
     gateUnlockToken: event.unlock_token,

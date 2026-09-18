@@ -18,8 +18,6 @@ defineProps<{ title?: string }>()
       </svg>
       <span>{{ title || 'GatePass' }}</span>
     </div>
-    <slot name="right">
-      <span class="gp-pill muted">Nimiq Pay</span>
-    </slot>
+    <slot name="right" />
   </header>
 </template>
