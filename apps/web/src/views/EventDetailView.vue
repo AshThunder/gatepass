@@ -4,9 +4,8 @@ import { api } from '@/api/client'
 import TierPicker from '@/components/TierPicker.vue'
 import SeatMap from '@/components/SeatMap.vue'
 import FlashBanner from '@/components/FlashBanner.vue'
-import { connectNimiq, ensureConsensus, isDemoAllowed, payForTicket, toErrorMessage } from '@/nimiq/wallet'
+import { connectNimiq, ensureConsensus, payForTicket, toErrorMessage } from '@/nimiq/wallet'
 import { useWallet } from '@/nimiq/useWallet'
-import { newId } from '@/lib/id'
 import { copyToClipboard } from '@/lib/copy'
 import ResultDialog from '@/components/ResultDialog.vue'
 import {
@@ -352,40 +351,6 @@ async function buyReal() {
     showResult(
       'fail',
       holdError(err) ? 'Seat not available' : 'Payment didn’t go through',
-      toErrorMessage(err),
-    )
-  }
-  finally {
-    loading.value = false
-  }
-}
-
-async function buyDemo() {
-  if (!event.value || !isDemoAllowed() || !canBuy.value)
-    return
-  error.value = ''
-  loading.value = true
-  try {
-    const buyer = address.value || 'NQ07 DEMO BUYER 0000 0000 0000 0000 0000'
-    await ensureHold(buyer)
-    const txHash = `demo-${newId()}`
-    const issued = await claimTickets(event.value.id, txHash, buyer, true)
-    persistTickets(issued, event.value)
-    clearHoldLocal()
-    status.value = `Success — ${issued.length} demo ticket(s)`
-    successFlash.value = true
-    showResult(
-      'success',
-      issued.length > 1 ? 'Demo tickets ready' : 'Demo ticket ready',
-      `${issued.length} pass${issued.length === 1 ? '' : 'es'} saved in Tickets.`,
-    )
-    pendingPurchase = { tickets: issued, event: event.value }
-  }
-  catch (err) {
-    status.value = ''
-    showResult(
-      'fail',
-      holdError(err) ? 'Seat not available' : 'Couldn’t issue demo ticket',
       toErrorMessage(err),
     )
   }
@@ -748,15 +713,6 @@ watch(() => props.eventId, () => {
             </div>
           </template>
 
-          <button
-            v-if="isDemoAllowed()"
-            class="gp-btn ghost sm"
-            :disabled="loading || !canBuy"
-            type="button"
-            @click="buyDemo"
-          >
-            Get demo ticket(s)
-          </button>
         </div>
 
         <details class="gp-details">

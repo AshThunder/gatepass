@@ -10,6 +10,7 @@ import {
 } from '@/crypto/ticket'
 import type { EventRecord, GateBundle } from '@gatepass/shared'
 import FlashBanner from '@/components/FlashBanner.vue'
+import GateStepper from '@/components/GateStepper.vue'
 
 const STORAGE_KEY = 'gatepass:gateBundle'
 const QUEUE_KEY = 'gatepass:redeemQueue'
@@ -51,7 +52,23 @@ let handling = false
 let autoTimer: ReturnType<typeof setInterval> | null = null
 let wakeLock: WakeLockSentinel | null = null
 
-const cachedCount = computed(() => bundle.value?.tickets.length || 0)
+const gateSteps = [
+  { title: 'Event' },
+  { title: 'PIN' },
+  { title: 'Unlock' },
+  { title: 'Scan' },
+]
+
+const gateStep = computed(() => {
+  if (unlocked.value)
+    return 3
+  if (staffPass.value.trim() && staffEventId.value)
+    return 2
+  if (staffEventId.value)
+    return 1
+  return 0
+})
+
 const validCached = computed(() =>
   bundle.value?.tickets.filter(t => t.status === 'valid').length || 0,
 )
@@ -495,13 +512,15 @@ onUnmounted(() => {
           Gate
         </h1>
         <p class="gp-page-sub">
-          {{ unlocked ? `Step 2 of 2 · ${bundle?.eventTitle}` : 'Step 1 of 2 · Unlock' }}
+          {{ unlocked ? bundle?.eventTitle : 'Unlock, then scan tickets.' }}
         </p>
       </div>
       <button class="gp-btn ghost sm" type="button" style="width: auto; flex-shrink: 0;" @click="toggleTablet">
         {{ tabletMode ? 'Phone' : 'Tablet' }}
       </button>
     </div>
+
+    <GateStepper :current="gateStep" :steps="gateSteps" />
 
     <template v-if="!unlocked">
       <div class="gp-card">

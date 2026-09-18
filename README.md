@@ -25,7 +25,6 @@ Crypto events still lean on PDF tickets and screenshot QR codes that anyone can 
 - **Discover** — upcoming events, search, today / weekend / all; **Nimiq Hall** nights get a Hall chip
 - **Nimiq Hall** — rent a platform venue evening (100 labeled seats, rows A–J) and sell the map
 - **Buy with NIM** — `sendBasicTransactionWithData` via `@nimiq/mini-app-sdk`; memo-verified issue
-- **Demo tickets** — optional no-chain path for dry runs (`VITE_ALLOW_DEMO` / `SKIP_TX_VERIFY`)
 - **Tickets** — rotating TOTP pass, send to a friend, inbox, reminder, Proof of Attendance badge
 - **Host** — Create or book the hall → My events: share link, **Check in guests**, staff PIN
 - **Gate** — host check-in unlocks the door on this phone; staff type the PIN; tablet mode `?tab=gate&tablet=1`
@@ -83,7 +82,7 @@ Open `http://localhost:5173`, or the Vite Network URL inside **Nimiq Pay → Min
 **Fast path (~60s):**
 
 1. **Discover** → open a listed event (or **Host** → Create / Book Nimiq Hall)
-2. Pick GA or a labeled seat → **Get demo ticket** (or **Pay with NIM** in Pay)
+2. Pick GA or a labeled seat → **Pay with NIM** in Nimiq Pay
 3. **Tickets** shows the rotating QR
 4. **Host → My events** → **Check in guests** (or **Gate** + staff PIN) → scan → ACCEPT
 
@@ -131,7 +130,7 @@ Check `/network` (or `/api/network` in production) for RPC reachability and tip 
 | Variable | Purpose |
 |----------|---------|
 | `VITE_API_BASE_URL` | API base (`/api` in prod / Vite proxy) |
-| `VITE_ALLOW_DEMO` | Show **Get demo ticket** |
+| `VITE_ALLOW_DEMO` | Allow demo hall rent / inbox helpers |
 
 ## Deploy (Railway)
 

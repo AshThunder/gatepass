@@ -5,7 +5,7 @@ import { connectNimiq, ensureConsensus, isDemoAllowed, payForHallRent, toErrorMe
 import { useWallet } from '@/nimiq/useWallet'
 import { newId } from '@/lib/id'
 import { copyToClipboard } from '@/lib/copy'
-import { ensureInboxSession } from '@/lib/session'
+import { ensureInboxSession, readSession } from '@/lib/session'
 import EventCard from '@/components/EventCard.vue'
 import { encodeGateUnlock, encodeStaffUnlock } from '@/crypto/ticket'
 import type {
@@ -368,7 +368,17 @@ watch(manageEventId, (id) => {
 })
 
 async function prepareManagedEvent(id: string) {
-  await ensureHostAccess(id)
+  const local = tokenFor(id)
+  if (local) {
+    manageToken.value = local
+  }
+  else {
+    manageToken.value = ''
+    const session = readSession()
+    const addr = organizerAddress.value.trim()
+    if (session && addr && session.address.replace(/\s+/g, '').toUpperCase() === addr.replace(/\s+/g, '').toUpperCase())
+      await ensureHostAccess(id)
+  }
   await refreshDoorKit(id)
   if (manageToken.value.trim() || tokenFor(id))
     void loadGuests(true)

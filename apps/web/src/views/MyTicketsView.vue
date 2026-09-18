@@ -14,7 +14,7 @@ import {
   upsertContact,
 } from '@/lib/contacts'
 import { appendSent, listSent, mergeOutbox, type SentRow } from '@/lib/sentTickets'
-import { demoInboxSession, ensureInboxSession } from '@/lib/session'
+import { demoInboxSession, ensureInboxSession, readSession } from '@/lib/session'
 import { isDemoAllowed } from '@/nimiq/wallet'
 import { useWallet } from '@/nimiq/useWallet'
 import {
@@ -545,7 +545,14 @@ watch(filtered, (list) => {
 watch(
   [() => props.active, walletReady, walletAddress],
   ([active, ready, addr]) => {
-    if (active && ready && addr)
+    if (!active || !ready || !addr)
+      return
+    const session = readSession()
+    if (!session)
+      return
+    const a = addr.replace(/\s+/g, '').toUpperCase()
+    const b = session.address.replace(/\s+/g, '').toUpperCase()
+    if (a === b)
       void syncInbox()
   },
   { immediate: true },

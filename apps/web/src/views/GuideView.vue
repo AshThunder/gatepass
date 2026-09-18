@@ -26,7 +26,7 @@ const emit = defineEmits<{
           <strong>Discover</strong> an event (or Host creates / rents the hall).
         </li>
         <li>
-          Guest <strong>pays with NIM</strong> in Nimiq Pay (or uses demo when enabled).
+          Guest <strong>pays with NIM</strong> in Nimiq Pay.
         </li>
         <li>
           Ticket lives under <strong>Tickets</strong> as a rotating QR.
@@ -122,7 +122,7 @@ const emit = defineEmits<{
       <ul class="bullets">
         <li>Open GatePass inside <em>Nimiq Pay → Mini Apps</em> for real wallet payments.</li>
         <li>Camera needs HTTPS (or localhost). Paste unlock / ticket codes if the camera is blocked.</li>
-        <li>Demo tickets appear when the host/env allows demo — useful for dry runs.</li>
+        <li>Pay with NIM inside Nimiq Pay — the memo is filled in for you.</li>
       </ul>
     </div>
   </section>

@@ -7,12 +7,10 @@ import {
   connectNimiq,
   tryConnectNimiq,
   ensureConsensus,
-  isDemoAllowed,
   listAccounts,
   payForTicket,
   toErrorMessage,
 } from '@/nimiq/wallet'
-import { newId } from '@/lib/id'
 import {
   type EventRecord,
   type TicketRecord,
@@ -186,30 +184,6 @@ async function buyReal() {
   }
 }
 
-async function buyDemo() {
-  error.value = ''
-  status.value = ''
-  if (!selected.value || !isDemoAllowed())
-    return
-  loading.value = true
-  try {
-    const buyer = address.value || 'NQ07 DEMO BUYER 0000 0000 0000 0000 0000'
-    const txHash = `demo-${newId()}`
-    const issued = await claimTicket(selected.value.id, txHash, buyer, true)
-    ticket.value = issued
-    eventForTicket.value = selected.value
-    persistTicket(issued, selected.value)
-    status.value = 'Demo ticket issued (no chain payment)'
-  }
-  catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
-    status.value = ''
-  }
-  finally {
-    loading.value = false
-  }
-}
-
 async function resumePendingClaim() {
   const raw = localStorage.getItem('gatepass:pendingTx')
   if (!raw)
@@ -329,16 +303,6 @@ watch(selectedId, () => {
         @click="buyReal"
       >
         {{ loading && providerReady ? 'Processing payment…' : payLabel }}
-      </button>
-
-      <button
-        v-if="isDemoAllowed()"
-        class="gp-btn ghost"
-        style="margin-top: 8px;"
-        :disabled="loading || !selected"
-        @click="buyDemo"
-      >
-        Get demo ticket (no chain)
       </button>
 
       <button
