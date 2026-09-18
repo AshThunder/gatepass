@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
+import * as catalog from '@/lib/catalog'
 import { connectNimiq, ensureConsensus, isDemoAllowed, payForHallRent, toErrorMessage } from '@/nimiq/wallet'
 import { useWallet } from '@/nimiq/useWallet'
 import { newId } from '@/lib/id'
@@ -55,7 +56,7 @@ const status = ref('')
 const created = ref<CreateEventResponse | null>(null)
 const gateQr = ref('')
 const unlockPayload = ref('')
-const events = ref<EventRecord[]>([])
+const events = catalog.events
 const copied = ref(false)
 const seatTemplates = ref<Array<{ id: SeatTemplateId, label: string, description: string }>>([])
 
@@ -158,7 +159,7 @@ const manageStaffPass = ref('')
 const showLiveBanner = ref(false)
 
 /** Nimiq Hall booking */
-const hall = ref<import('@gatepass/shared').HallInfo | null>(null)
+const hall = catalog.hall
 const hallSlotId = ref('')
 const hallTitle = ref('')
 const hallTicketPrice = ref(1)
@@ -319,13 +320,19 @@ async function ensureHostAccess(eventId: string): Promise<boolean> {
 }
 
 async function refreshEvents() {
-  const res = await api.listEvents()
-  events.value = res.events
+  await catalog.refreshCatalog()
   const mine = events.value.filter(isMine)
   if (manageEventId.value && !mine.some(e => e.id === manageEventId.value))
     manageEventId.value = ''
   if (manageEventId.value)
     manageToken.value = tokenFor(manageEventId.value)
+}
+
+async function loadHall() {
+  await catalog.refreshCatalog()
+  const open = hall.value?.slots.find(s => s.status === 'open')
+  if (open && !hallSlotId.value)
+    hallSlotId.value = open.id
 }
 
 function syncOrganizerFromWallet() {
@@ -543,16 +550,6 @@ async function onCreate() {
   }
 }
 
-async function loadHall() {
-  try {
-    hall.value = await api.getHall()
-    const open = hall.value.slots.find(s => s.status === 'open')
-    if (open && !hallSlotId.value)
-      hallSlotId.value = open.id
-  }
-  catch { /* optional */ }
-}
-
 const nextHallSlotLabel = computed(() => {
   const s = (hall.value?.slots || []).find(x => x.status === 'open')
   if (!s)
@@ -572,9 +569,18 @@ watch(() => props.expandHall, (on) => {
 })
 
 watch(() => props.active, (on, was) => {
-  if (on && was === false)
-    hallOpen.value = !!props.expandHall
+  if (on) {
+    void refreshEvents()
+    if (was === false)
+      hallOpen.value = !!props.expandHall
+  }
 })
+
+watch(hall, (info) => {
+  const open = info?.slots.find(s => s.status === 'open')
+  if (open && !hallSlotId.value)
+    hallSlotId.value = open.id
+}, { immediate: true })
 
 function onHallToggle(ev: Event) {
   hallOpen.value = (ev.currentTarget as HTMLDetailsElement).open

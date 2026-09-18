@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
+import { refreshCatalog, setCanReload, startCatalogSync } from '@/lib/catalog'
 import AppHeader from '@/components/AppHeader.vue'
 import BouncerView from '@/views/BouncerView.vue'
 import DiscoverView from '@/views/DiscoverView.vue'
@@ -36,6 +37,8 @@ const overflowEl = ref<HTMLElement | null>(null)
 const { ready: walletReady, busy: walletBusy, label: walletLabel, connect: connectWallet, probe: probeWallet } = useWallet()
 
 onMounted(async () => {
+  setCanReload(() => tab.value !== 'gate' && !selectedEventId.value)
+  startCatalogSync()
   flushDueReminders()
   void probeWallet()
   const params = new URLSearchParams(window.location.search)
@@ -210,6 +213,8 @@ function onPurchased(tickets: TicketRecord[], event: EventRecord) {
 watch(tab, (t) => {
   if (t !== 'discover')
     selectedEventId.value = null
+  if (t === 'discover' || t === 'host' || t === 'gate')
+    void refreshCatalog()
 })
 </script>
 
@@ -282,6 +287,7 @@ watch(tab, (t) => {
         <!-- Keep tabs mounted so Host/Gate/Tickets state survives navigation -->
         <section v-show="tab === 'discover' && !selectedEventId" class="gp-panel">
           <DiscoverView
+            :active="tab === 'discover' && !selectedEventId"
             @open-event="openEvent"
             @go-host="goHost"
           />

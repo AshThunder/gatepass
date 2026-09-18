@@ -8,6 +8,7 @@ import {
   decodeStaffUnlock,
   verifyTotp,
 } from '@/crypto/ticket'
+import * as catalog from '@/lib/catalog'
 import type { EventRecord, GateBundle } from '@gatepass/shared'
 import FlashBanner from '@/components/FlashBanner.vue'
 import GateStepper from '@/components/GateStepper.vue'
@@ -45,7 +46,7 @@ const scanning = ref(false)
 const pendingCount = ref(0)
 const cameraHint = ref('')
 const lastSyncedLabel = ref('')
-const events = ref<EventRecord[]>([])
+const events = catalog.events
 const staffEventId = ref('')
 const staffPass = ref('')
 const tabletMode = ref(localStorage.getItem(TABLET_KEY) === '1')
@@ -551,13 +552,10 @@ onMounted(async () => {
     void refreshBundle().catch(() => {})
     void syncQueue()
   }, AUTO_MS)
-  try {
-    const res = await api.listEvents()
-    events.value = res.events
+  void catalog.refreshCatalog().then(() => {
     if (staffEvents.value.length === 1)
       staffEventId.value = staffEvents.value[0]!.id
-  }
-  catch { /* ignore */ }
+  }).catch(() => {})
 })
 
 onUnmounted(() => {

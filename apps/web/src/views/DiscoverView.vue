@@ -1,23 +1,26 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { api } from '@/api/client'
+import { computed, onMounted, ref, watch } from 'vue'
+import * as catalog from '@/lib/catalog'
 import EventCard from '@/components/EventCard.vue'
 import HallMapPreview from '@/components/HallMapPreview.vue'
 import FlashBanner from '@/components/FlashBanner.vue'
-import type { EventRecord, HallInfo } from '@gatepass/shared'
 
 const emit = defineEmits<{
   openEvent: [eventId: string]
   goHost: [hall?: boolean]
 }>()
 
+const props = defineProps<{
+  active?: boolean
+}>()
+
 type Filter = 'upcoming' | 'tonight' | 'weekend' | 'all'
 
-const events = ref<EventRecord[]>([])
-const hall = ref<HallInfo | null>(null)
+const events = catalog.events
+const hall = catalog.hall
+const loading = catalog.loading
+const error = catalog.error
 const showHallPreview = ref(false)
-const loading = ref(true)
-const error = ref('')
 const query = ref('')
 const filter = ref<Filter>('upcoming')
 const showEnded = ref(false)
@@ -127,22 +130,13 @@ const resultLabel = computed(() => {
 })
 
 async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    const [res] = await Promise.all([
-      api.listEvents(),
-      api.getHall().then((h) => { hall.value = h }).catch(() => { hall.value = null }),
-    ])
-    events.value = res.events
-  }
-  catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
-  }
-  finally {
-    loading.value = false
-  }
+  await catalog.refreshCatalog()
 }
+
+watch(() => props.active, (on) => {
+  if (on)
+    void catalog.refreshCatalog()
+})
 
 onMounted(() => {
   void load()

@@ -3,6 +3,7 @@ import path from 'node:path'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import { cors } from 'hono/cors'
 import type { HoldRequest, PurchaseItem, PurchaseRequest } from '@gatepass/shared'
 import {
@@ -34,6 +35,11 @@ import { getHallInfo, rentHallSlot } from './halls.js'
 
 /** API routes — mounted at `/` (local) and `/api` (production SPA). */
 const api = new Hono()
+
+api.use('*', async (c, next) => {
+  await next()
+  c.header('Cache-Control', 'no-store')
+})
 
 api.get('/health', c => c.json({ ok: true, service: 'gatepass-api' }))
 
@@ -340,6 +346,34 @@ if (staticDir) {
   const root = path.resolve(staticDir)
   const indexHtml = path.join(root, 'index.html')
 
+  async function spaIndex(c: Context) {
+    const html = await readFile(indexHtml, 'utf8')
+    c.header('Cache-Control', 'no-cache, no-store, must-revalidate')
+    return c.html(html)
+  }
+
+  app.get('/', async (c) => {
+    try {
+      return await spaIndex(c)
+    }
+    catch {
+      return c.text('GatePass web build missing', 500)
+    }
+  })
+  app.get('/index.html', async (c) => {
+    try {
+      return await spaIndex(c)
+    }
+    catch {
+      return c.text('GatePass web build missing', 500)
+    }
+  })
+
+  app.use('/assets/*', async (c, next) => {
+    await next()
+    c.header('Cache-Control', 'public, max-age=31536000, immutable')
+  })
+
   app.use(
     '/*',
     serveStatic({
@@ -350,8 +384,7 @@ if (staticDir) {
 
   app.get('*', async (c) => {
     try {
-      const html = await readFile(indexHtml, 'utf8')
-      return c.html(html)
+      return await spaIndex(c)
     }
     catch {
       return c.text('GatePass web build missing', 500)
